@@ -1,0 +1,27 @@
+diff --git a/android/build.gradle b/android/build.gradle
+--- a/android/build.gradle
++++ b/android/build.gradle
+@@ -2,13 +2,6 @@
+     ext.safeExtGet = {prop, fallback ->
+         rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+     }
+-    repositories {
+-        google()
+-        gradlePluginPortal()
+-    }
+-    dependencies {
+-        classpath("com.android.tools.build:gradle:7.0.4")
+-    }
+ }
+ 
+ def isNewArchitectureEnabled() {
+@@ -29,6 +22,9 @@
+         targetSdkVersion safeExtGet('targetSdkVersion', 31)
+         buildConfigField("boolean", "IS_NEW_ARCHITECTURE_ENABLED", isNewArchitectureEnabled().toString())
+     }
++    buildFeatures {
++        buildConfig true
++    }
+     sourceSets {
+         main {
+             if (isNewArchitectureEnabled()) {

@@ -9,6 +9,20 @@ applyKotlinExpoModulesCorePlugin()
 useCoreDependencies()
 useExpoPublishing()
 
+def mapboxDownloadsToken = (
+  System.getenv('MAPBOX_DOWNLOADS_TOKEN') ?:
+  (findProperty('MAPBOX_DOWNLOADS_TOKEN') ?: '')
+).toString().trim()
+def forceSkipMapbox = System.getenv('MENTRA_SKIP_MAPBOX') == '1' ||
+  findProperty('mentraSkipMapbox') == 'true'
+def forceIncludeMapbox = System.getenv('MENTRA_SKIP_MAPBOX') == '0' ||
+  findProperty('mentraSkipMapbox') == 'false'
+def hasRealMapboxDownloadsToken = !forceSkipMapbox &&
+  (forceIncludeMapbox || mapboxDownloadsToken.startsWith('sk.'))
+if (!hasRealMapboxDownloadsToken) {
+  logger.lifecycle('[mentra-crust] Skipping Mapbox Navigation SDK (dummy or missing MAPBOX_DOWNLOADS_TOKEN). Turn-by-turn navigation is a no-op in this build.')
+}
+
 // MentraJS Android runtime: QuickJS via dokar3/quickjs-kt.
 //
 // Zipline's `bind(name, service)` registers services in an internal Kotlin
@@ -59,6 +73,14 @@ android {
   sourceSets {
     main {
       assets.srcDirs += '../../jspolyfill/assets'
+      // Real Mapbox secret tokens are `sk.…`. The .env dummy is `sk-ci-dummy-…`
+      // (hyphen, not dot) so local builds without a Downloads:Read token compile
+      // a no-op NavigationManager and skip the authenticated Maven artifacts.
+      if (hasRealMapboxDownloadsToken) {
+        java.srcDirs += 'src/mapbox/java'
+      } else {
+        java.srcDirs += 'src/nomapbox/java'
+      }
     }
   }
   compileOptions {
@@ -97,13 +119,17 @@ dependencies {
   // APK weight). `:navigation` is the core engine; `:tripdata` carries the
   // banner/maneuver formatting used to label turns.
   // Version pinned to 3.25.0 — re-check https://docs.mapbox.com/android/navigation/releases/
-  def isChinaBuild = System.getenv("EXPO_PUBLIC_DEPLOYMENT_REGION") == "china"
-  if (isChinaBuild) {
-    compileOnly 'com.mapbox.navigationcore:navigation:3.25.0'
-    compileOnly 'com.mapbox.navigationcore:tripdata:3.25.0'
-  } else {
-    implementation 'com.mapbox.navigationcore:navigation:3.25.0'
-    implementation 'com.mapbox.navigationcore:tripdata:3.25.0'
+  // Dummy/missing MAPBOX_DOWNLOADS_TOKEN skips these artifacts entirely so Gradle
+  // does not 401 against api.mapbox.com. CI still injects a real `sk.` token.
+  if (hasRealMapboxDownloadsToken) {
+    def isChinaBuild = System.getenv("EXPO_PUBLIC_DEPLOYMENT_REGION") == "china"
+    if (isChinaBuild) {
+      compileOnly 'com.mapbox.navigationcore:navigation:3.25.0'
+      compileOnly 'com.mapbox.navigationcore:tripdata:3.25.0'
+    } else {
+      implementation 'com.mapbox.navigationcore:navigation:3.25.0'
+      implementation 'com.mapbox.navigationcore:tripdata:3.25.0'
+    }
   }
 
   // Required for Java 8+ APIs on minSdk < 26 (was needed by Google Nav SDK;

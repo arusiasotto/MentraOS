@@ -172,6 +172,19 @@ export default function PairingSuccessScreen() {
         },
       ]
       break
+    case DeviceTypes.S3_WATCH:
+      steps = [
+        {
+          name: "Start Onboarding",
+          type: "image",
+          source: glassesImage,
+          containerClassName: "px-12",
+          transition: false,
+          title: translate("common:success"),
+          subtitle: "ESP32-S3 Watch connected",
+        },
+      ]
+      break
     case DeviceTypes.G1:
     default:
       steps = [
@@ -195,6 +208,18 @@ export default function PairingSuccessScreen() {
           transition: false,
           title: translate("common:success"),
           subtitle: translate("onboarding:r1Connected"),
+        },
+      ]
+      break
+    case ControllerTypes.KEYFOB:
+      steps = [
+        {
+          name: "Start Onboarding",
+          type: "image",
+          source: glassesImage,
+          transition: false,
+          title: translate("common:success"),
+          subtitle: translate("onboarding:keyfobConnected"),
         },
       ]
       break

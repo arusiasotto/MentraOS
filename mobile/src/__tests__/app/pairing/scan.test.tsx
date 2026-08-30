@@ -18,6 +18,7 @@ jest.mock("@/../../cloud/packages/types/src", () => ({
     G1: "Even Realities G1",
     G2: "Even Realities G2",
     AR99: "AR99",
+    S3_WATCH: "ESP32-S3 Watch",
   },
 }))
 
@@ -704,5 +705,24 @@ describe("pairing scan screen", () => {
     })
 
     expect(queryByText("Xingyi AR99")).toBeNull()
+  })
+
+  it("filters ESP32-S3 Watch scan results by device model", async () => {
+    ;(useLocalSearchParams as jest.Mock).mockReturnValue({deviceModel: "ESP32-S3 Watch"})
+    useCoreStore.setState({
+      searchResults: [
+        {id: "watch", model: "ESP32-S3 Watch", name: "S3Watch-CEC5BA", address: "AA:BB:CC:DD:EE:66"},
+        {id: "g1", model: "Even Realities G1", name: "G1_123", address: "AA:BB:CC:DD:EE:77"},
+      ],
+    })
+
+    const {getByText, queryByText} = render(<SelectGlassesBluetoothScreen />)
+
+    await waitFor(() => {
+      expect(engine.pairing.scan).toHaveBeenCalledWith("ESP32-S3 Watch")
+    })
+
+    expect(getByText("S3Watch-CEC5BA")).toBeTruthy()
+    expect(queryByText("G1_123")).toBeNull()
   })
 })

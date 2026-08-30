@@ -11,8 +11,10 @@ export enum DeviceTypes {
   Z100 = "Vuzix Z100",
   NEX = "Mentra Display",
   FRAME = "Brilliant Frame",
+  S3_WATCH = "ESP32-S3 Watch",
 }
 
 export enum ControllerTypes {
   R1 = "Even Realities R1",
+  KEYFOB = "XIAO Keyfob",
 }

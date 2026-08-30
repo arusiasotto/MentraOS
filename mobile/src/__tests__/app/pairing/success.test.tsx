@@ -12,6 +12,7 @@ import {useNavigationStore} from "@/stores/navigation"
 jest.mock("@/../../cloud/packages/types/src", () => ({
   ControllerTypes: {
     R1: "Mentra Mach1",
+    KEYFOB: "XIAO Keyfob",
   },
   DeviceTypes: {
     LIVE: "Mentra Live",
@@ -21,6 +22,7 @@ jest.mock("@/../../cloud/packages/types/src", () => ({
     MACH1: "Mach1",
     NEX: "Mentra Nex",
     AR99: "AR99",
+    S3_WATCH: "ESP32-S3 Watch",
   },
   getModelCapabilities: jest.fn((deviceModel: string) => ({
     hasOta: deviceModel === "Mentra Live" || deviceModel === "AR99",

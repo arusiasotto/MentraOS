@@ -54,8 +54,8 @@ export function useHasDeviceInfo(): boolean {
  * layout), with capability-specific rows (G2 menu, WiFi, OTA, Nex, Mentra Live
  * button, super-mode tools) slotting in where applicable.
  *
- * Embedded inline on the flattened main settings page. Returns null when no
- * device is paired.
+ * Embedded inline on the flattened main settings page. When no glasses are
+ * paired, still shows Pair controller so a keyfob or ring can be added.
  */
 export function DeviceSettingsSection() {
   const {theme} = useAppTheme()
@@ -78,6 +78,13 @@ export function DeviceSettingsSection() {
 
   const {push} = useNavigationStore.getState()
   const features: Capabilities = getModelCapabilities(defaultWearable)
+  const pairControllerButton = (
+    <RouteButton
+      icon={<Icon name="bluetooth" size={24} color={theme.colors.secondary_foreground} />}
+      label={translate("deviceSettings:pairController")}
+      onPress={() => push("/pairing/select-controller")}
+    />
+  )
 
   const otaProgress = otaSnapshot.legacyProgress
   const isAr99Family =
@@ -142,9 +149,9 @@ export function DeviceSettingsSection() {
     }
   }
 
-  // No glasses paired at all — no device section to show.
+  // No glasses paired — still offer the controller list (R1, XIAO Keyfob).
   if (!defaultWearable) {
-    return null
+    return <View style={{gap: theme.spacing.s2}}>{pairControllerButton}</View>
   }
 
   return (
@@ -289,14 +296,7 @@ export function DeviceSettingsSection() {
         />
       )}
 
-      {/* Pair controller — super mode */}
-      {superMode && (
-        <RouteButton
-          icon={<Icon name="bluetooth" size={24} color={theme.colors.secondary_foreground} />}
-          label={translate("deviceSettings:pairController")}
-          onPress={() => push("/pairing/select-controller")}
-        />
-      )}
+      {pairControllerButton}
 
       {/* a bit more space to scroll */}
       <Spacer height={theme.spacing.s2} />

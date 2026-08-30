@@ -516,7 +516,9 @@ export const DeviceModels = {
   Frame: "Brilliant Frame",
   Nimo: "NIMO",
   Ar99: "AR99",
+  S3Watch: "ESP32-S3 Watch",
   R1: "Even Realities R1",
+  Keyfob: "XIAO Keyfob",
 } as const
 
 export type DeviceModel = (typeof DeviceModels)[keyof typeof DeviceModels]

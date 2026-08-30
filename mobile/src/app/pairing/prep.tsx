@@ -302,6 +302,17 @@ export default function PairingPrepScreen() {
     )
   }
 
+  const S3WatchPairingGuide = () => {
+    return (
+      <View className="flex-1 flex-col justify-start mt-6">
+        <Text tx="pairing:instructions" className="text-2xl font-bold mb-4 text-secondary-foreground" />
+        <Text className="text-lg text-secondary-foreground mb-2" tx="pairingGuides:S3_WATCH.disclaimer" />
+        <Text className="text-lg text-secondary-foreground mb-2" tx="pairingGuides:S3_WATCH.step1" />
+        <Text className="text-lg text-secondary-foreground mb-2" tx="pairingGuides:S3_WATCH.step2" />
+      </View>
+    )
+  }
+
   const renderGuide = () => {
     switch (deviceModel) {
       case DeviceTypes.SIMULATED:
@@ -322,6 +333,8 @@ export default function PairingPrepScreen() {
         return <NimoPairingGuide />
       case DeviceTypes.AR99:
         return <Ar99PairingGuide />
+      case DeviceTypes.S3_WATCH:
+        return <S3WatchPairingGuide />
     }
 
     throw new Error(`Unknown model name: ${deviceModel}`)

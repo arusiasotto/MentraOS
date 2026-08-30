@@ -137,7 +137,7 @@ export const ConnectControllerButton = () => {
 
   const connectController = async () => {
     if (!defaultController) {
-      push("/pairing/select-glasses-model")
+      push("/pairing/select-controller")
       return
     }
 
@@ -172,7 +172,7 @@ export const ConnectControllerButton = () => {
   const defaultControllerEmpty = defaultController === ""
 
   if (defaultControllerNull || defaultControllerStringNull || defaultControllerEmpty) {
-    return <Button onPress={() => push("/pairing/select-glasses-model")} tx="home:pairController" />
+    return <Button onPress={() => push("/pairing/select-controller")} tx="home:pairController" />
   }
 
   if (isSearching) {

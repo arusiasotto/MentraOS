@@ -207,6 +207,10 @@ push("/settings/profile")
   - `~/.netrc` for iOS (SPM reads it): `machine api.mapbox.com login mapbox password sk.…`
   - `MAPBOX_DOWNLOADS_TOKEN` env var for Android (Gradle maven repo auth)
   - GitHub Actions secret `MAPBOX_DOWNLOADS_TOKEN` for CI
+- Local Android builds **without** a real `sk.…` token skip the Navigation SDK
+  and compile a no-op `NavigationManager`. Pairing and glasses still work;
+  turn-by-turn navigation does not. The `.env` dummy (`sk-ci-dummy-…`) is that
+  path. A real token restores the proprietary SDK.
 
 Gotchas learned the hard way (2026-07):
 

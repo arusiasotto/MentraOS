@@ -15,6 +15,7 @@ jest.mock("@/../../cloud/packages/types/src", () => ({
     Z100: "Vuzix Z100",
     NEX: "Mentra Nex",
     NIMO: "Nimo",
+    S3_WATCH: "ESP32-S3 Watch",
   },
 }))
 
@@ -101,6 +102,22 @@ describe("glasses model selection", () => {
     expect(preparePairingScan).not.toHaveBeenCalled()
     expect(push).toHaveBeenCalledWith("/pairing/prep", {
       deviceModel: "Even Realities G1",
+      ar99ProjectName: undefined,
+    })
+  })
+
+  it("labels the ESP32-S3 Watch as unofficial Waveshare hardware", () => {
+    const {getByText} = render(<SelectGlassesModelScreen />)
+    expect(getByText("Waveshare (unofficial)")).toBeTruthy()
+  })
+
+  it("opens prep for the ESP32-S3 Watch", () => {
+    const {getByTestId} = render(<SelectGlassesModelScreen />)
+
+    fireEvent.press(getByTestId("pairing-model-esp32-s3-watch"))
+
+    expect(push).toHaveBeenCalledWith("/pairing/prep", {
+      deviceModel: "ESP32-S3 Watch",
       ar99ProjectName: undefined,
     })
   })

@@ -744,6 +744,8 @@ struct ViewState {
 
         if controllerModel == ControllerTypes.R1 {
             controller = R1()
+        } else if controllerModel == ControllerTypes.KEYFOB {
+            controller = Keyfob()
         }
     }
 
@@ -1785,6 +1787,7 @@ struct ViewState {
         // if the pending wearable is a controller, don't disconnect, use the controller manager to connect
         if ControllerTypes.ALL.contains(pendingWearable) {
             controller?.disconnect()
+            initController(pendingWearable)
             controller?.connectById(name)
             return
         }

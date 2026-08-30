@@ -10,6 +10,7 @@ import { simulatedGlasses } from "./capabilities/simulated-glasses";
 import { vuzixZ100 } from "./capabilities/vuzix-z100";
 import { nimo } from "./capabilities/nimo";
 import { none } from "./capabilities/none";
+import { s3Watch } from "./capabilities/s3-watch";
 import { DeviceTypes, HardwareRequirementLevel, HardwareType } from "./enums";
 
 /**
@@ -176,6 +177,7 @@ export const HARDWARE_CAPABILITIES: Record<string, Capabilities> = {
   [vuzixZ100.modelName]: vuzixZ100,
   [DeviceTypes.MACH1]: vuzixZ100, // Mach1 uses same Vuzix Ultralite hardware as Z100
   [nimo.modelName]: nimo,
+  [s3Watch.modelName]: s3Watch,
   [DeviceTypes.AR99]: {
     ...evenRealitiesG1,
     modelName: DeviceTypes.AR99,
@@ -202,4 +204,4 @@ export const getModelCapabilities = (deviceType: DeviceTypes): Capabilities => {
 };
 
 // export * from "./capabilities"
-export { simulatedGlasses, evenRealitiesG1, evenRealitiesG2, mentraLive, vuzixZ100, mentraDisplay, nimo };
+export { simulatedGlasses, evenRealitiesG1, evenRealitiesG2, mentraLive, vuzixZ100, mentraDisplay, nimo, s3Watch };

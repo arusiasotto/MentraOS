@@ -38,8 +38,10 @@ export enum DeviceTypes {
   NEX = "Mentra Display",
   FRAME = "Brilliant Frame",
   NIMO = "NIMO",
+  S3_WATCH = "ESP32-S3 Watch",
 }
 
 export enum ControllerTypes {
   R1 = "Even Realities R1",
+  KEYFOB = "XIAO Keyfob",
 }
