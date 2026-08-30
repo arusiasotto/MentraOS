@@ -42,3 +42,5 @@ Any plan that will span multiple chat sessions should be saved as a file under `
 ## Other content under `notes/`
 
 Architecture notes, bluetooth-sdk subsystem docs, OTA specs, and related material also live under `notes/` (and under `agents/` for agent scratchpads). Use the superpowers layout above for **new** multi-session implementation plans.
+
+How to add a BLE remote/ring/fob (Keyfob-style): [adding-a-controller.md](adding-a-controller.md).
