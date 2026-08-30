@@ -57,6 +57,9 @@ name prefix `Keyfob` and uses the custom GATT in
 Buttons: D0 primary (`single_tap` / `double_tap` / `hold`), D1 `swipe_up`,
 D2 `swipe_down`. RGB LED and battery percent are reported to the Mentra App.
 
+Contributor how-to for another controller:
+[`notes/adding-a-controller.md`](notes/adding-a-controller.md).
+
 
 ## Getting Started
 

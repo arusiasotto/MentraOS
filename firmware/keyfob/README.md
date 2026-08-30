@@ -12,6 +12,9 @@ The phone driver is
 UUIDs and opcodes live in [`settings.h`](settings.h) and
 `KeyfobProtocol.kt` — keep them identical.
 
+Adding another remote? Follow
+[`notes/adding-a-controller.md`](../../notes/adding-a-controller.md).
+
 ## Identity
 
 - BLE name prefix: `Keyfob` (MAC suffix appended when `DEVICE_ID` is empty)
