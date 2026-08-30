@@ -15,6 +15,7 @@ prefix unless the hardware is validated and listed here.
 | Mentra Mach 1 | Full | Not available | Partial* | Not available | Not available |
 | Vuzix Z100 | Full | Not available | Partial* | Not available | Not available |
 | Xingyi AR99 | Full | Not available | Full | Not available | Not available |
+| ESP32-S3 Watch | Full | Full | Full | Not available | Not available |
 
 * Microphone support via connected phone's microphone.
 
@@ -31,6 +32,31 @@ Only the exact BLE project identifier listed below is supported.
 must be rejected by scanning and advertisement parsing. AR99 pairing must fail
 closed when a scan result has no project identifier or has a project identifier
 outside the matrix above.
+
+## ESP32-S3 Watch
+
+This fork adds unofficial MentraOS support for the Waveshare ESP32-S3-Touch-AMOLED-2.06
+as `DeviceTypes.S3_WATCH` (`ESP32-S3 Watch`). **This is not a Waveshare product and is
+not affiliated with, endorsed by, or supported by Waveshare.**
+
+The watch advertises BLE name prefix `S3Watch` and uses the custom GATT in
+`firmware/s3-watch/settings.h`. Pairing reconnects by Bluetooth address.
+Capabilities: 410x502 color AMOLED, JPEG bitmaps, 16 kHz PCM microphone.
+No OTA, camera, or speaker path in v1.
+
+## XIAO Keyfob
+
+This fork adds unofficial MentraOS support for the Seeed Studio XIAO nRF52840 Plus
+as `ControllerTypes.KEYFOB` (`XIAO Keyfob`). **This is not a Seeed product and is
+not affiliated with, endorsed by, or supported by Seeed Studio.**
+
+The fob pairs as a controller (same role as the Even Realities R1 ring), not as
+glasses. Pair from Settings → Pair controller → XIAO Keyfob. It advertises BLE
+name prefix `Keyfob` and uses the custom GATT in
+`firmware/keyfob/settings.h`. Pairing reconnects by Bluetooth address.
+Buttons: D0 primary (`single_tap` / `double_tap` / `hold`), D1 `swipe_up`,
+D2 `swipe_down`. RGB LED and battery percent are reported to the Mentra App.
+
 
 ## Getting Started
 

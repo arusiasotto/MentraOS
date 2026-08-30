@@ -29,9 +29,11 @@ struct DeviceTypes {
 
 struct ControllerTypes {
     static let R1 = "Even Realities R1"
+    static let KEYFOB = "XIAO Keyfob"
 
     static let ALL = [
         R1,
+        KEYFOB,
     ]
 
     /// Private init to prevent instantiation

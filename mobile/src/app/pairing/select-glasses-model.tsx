@@ -52,6 +52,8 @@ export default function SelectGlassesModelScreen() {
         return <MentraLogo color={theme.colors.text} />
       case DeviceTypes.Z100:
         return <VuzixLogo color={theme.colors.text} />
+      case DeviceTypes.S3_WATCH:
+        return <Text text="Waveshare (unofficial)" className="text-foreground font-semibold text-lg" />
       case DeviceTypes.NIMO:
         return <NimoLogo />
       default:
@@ -81,6 +83,7 @@ export default function SelectGlassesModelScreen() {
     {deviceModel: DeviceTypes.G2, key: "evenrealities_g2", modelId: "even-realities-g2"},
     {deviceModel: DeviceTypes.MACH1, key: "mentra_mach1", modelId: "mentra-mach1"},
     {deviceModel: DeviceTypes.Z100, key: "vuzix-z100", modelId: "vuzix-z100"},
+    {deviceModel: DeviceTypes.S3_WATCH, key: "esp32-s3-watch", modelId: "esp32-s3-watch"},
     {deviceModel: DeviceTypes.NEX, key: "mentra_nex", modelId: "mentra-display"},
     {deviceModel: DeviceTypes.NIMO, key: "nimo", modelId: "nimo"},
   ]

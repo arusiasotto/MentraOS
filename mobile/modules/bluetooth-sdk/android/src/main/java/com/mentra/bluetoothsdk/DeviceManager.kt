@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
 import com.mentra.bluetoothsdk.controllers.ControllerManager
+import com.mentra.bluetoothsdk.controllers.Keyfob
 import com.mentra.bluetoothsdk.controllers.R1
 import com.mentra.bluetoothsdk.services.ForegroundService
 import com.mentra.bluetoothsdk.services.G2ConnectionRecovery
@@ -27,6 +28,7 @@ import com.mentra.bluetoothsdk.sgcs.MentraNex
 import com.mentra.bluetoothsdk.sgcs.Nimo
 import com.mentra.bluetoothsdk.sgcs.SGCManager
 import com.mentra.bluetoothsdk.sgcs.Simulated
+import com.mentra.bluetoothsdk.sgcs.S3Watch
 import com.mentra.bluetoothsdk.utils.ControllerTypes
 import com.mentra.bluetoothsdk.utils.DeviceTypes
 import com.mentra.bluetoothsdk.utils.MicMap
@@ -1402,6 +1404,8 @@ class DeviceManager internal constructor(initializeHardware: Boolean) {
             sgc = MentraNex()
         } else if (wearable.contains(DeviceTypes.AR99)) {
             sgc = Ar99()
+        } else if (wearable.contains(DeviceTypes.S3_WATCH)) {
+            sgc = S3Watch()
         } else if (wearable.contains(DeviceTypes.MACH1)) {
             sgc = createOptionalMach1Sgc(DeviceTypes.MACH1)
         } else if (wearable.contains(DeviceTypes.Z100)) {
@@ -1443,6 +1447,8 @@ class DeviceManager internal constructor(initializeHardware: Boolean) {
 
         if (controllerType == ControllerTypes.R1) {
             controller = R1()
+        } else if (controllerType == ControllerTypes.KEYFOB) {
+            controller = Keyfob()
         }
     }
 
@@ -2337,7 +2343,10 @@ class DeviceManager internal constructor(initializeHardware: Boolean) {
             return
         }
         val reconnectTarget =
-            if (defaultWearable.contains(DeviceTypes.AR99) && deviceAddress.isNotBlank()) {
+            if ((defaultWearable.contains(DeviceTypes.AR99) ||
+                    defaultWearable.contains(DeviceTypes.S3_WATCH)) &&
+                deviceAddress.isNotBlank()
+            ) {
                 deviceAddress
             } else {
                 deviceName
