@@ -24,8 +24,10 @@ enum class DeviceModel(val deviceType: String) {
     FRAME(DeviceTypes.FRAME),
     NIMO(DeviceTypes.NIMO),
     AR99(DeviceTypes.AR99),
+    S3_WATCH(DeviceTypes.S3_WATCH),
     SIMULATED(DeviceTypes.SIMULATED),
-    R1(ControllerTypes.R1);
+    R1(ControllerTypes.R1),
+    KEYFOB(ControllerTypes.KEYFOB);
 
     companion object {
         @JvmStatic

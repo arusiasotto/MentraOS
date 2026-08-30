@@ -22,6 +22,7 @@ public enum DeviceModel: String {
     case ar99
     case simulated
     case r1
+    case keyfob
 
     public var deviceType: String {
         switch self {
@@ -47,6 +48,8 @@ public enum DeviceModel: String {
             DeviceTypes.SIMULATED
         case .r1:
             ControllerTypes.R1
+        case .keyfob:
+            ControllerTypes.KEYFOB
         }
     }
 
@@ -74,6 +77,8 @@ public enum DeviceModel: String {
             .simulated
         case ControllerTypes.R1:
             .r1
+        case ControllerTypes.KEYFOB:
+            .keyfob
         default:
             .mentraLive
         }
