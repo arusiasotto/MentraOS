@@ -63,8 +63,9 @@ Do not start Phase 1 until command 29 is seen with Mentra (or nRF Connect /
 `bleak`) as the only central.
 
 - [ ] Forget QRing and system Bluetooth bond
-- [ ] Record advertised name
+- [ ] Record advertised name (`COLMI R12_<hex>`, PulseLoop regex `^COLMI R12_.*`)
 - [ ] Confirm Yawell service + notify char
+- [ ] Optional: PulseLoop Developer raw-packet trace while using the media panel; grep export for commandId 29 / hex `1d`
 - [ ] Battery command 3
 - [ ] Media-panel taps/swipes → command 29 actions 1–5 (hex log)
 - [ ] Command 28 dummy now-playing: does the music face stay up?

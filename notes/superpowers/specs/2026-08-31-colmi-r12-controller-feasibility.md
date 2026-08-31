@@ -80,15 +80,100 @@ Every command is 16 bytes: `[id:u8][data:14][crc:u8]`, CRC = sum of the
 first 15 bytes `& 0xFF`. There is a second “firmware / big data” service
 (`de5bf728-…`); a controller does not need it.
 
-Advertised names in the wild: `R12`, `R12_XXXX`, `Colmi`. Confirm on a
-nRF Connect scan. Do not assume the R02 `R0n_xxxx` regex.
+Advertised name (confirmed by PulseLoop’s pairing catalog, not a guess):
+`COLMI R12_<hex serial>`, regex `^COLMI R12_.*`. Mentra’s scan matcher
+should use that prefix. Do not use the older R02 `R0n_xxxx` regex.
 
 Community note: the ring is often invisible if it is already bonded to
 QRing or another central. Mentra should own the only GATT session.
 
 ---
 
-## 3. The media panel is GATT, not HID
+## 3. PulseLoopAndroid — what it records, what we can reuse
+
+Source: [foureight84/PulseLoopAndroid](https://github.com/foureight84/PulseLoopAndroid)
+(Kotlin port of PulseLoop iOS). It is a **health companion**, not a
+controller app. The Colmi R12 is a first-class catalog model
+(`WearableModel.COLMI_R12`) on the **same** `ColmiDriver` as R02/R10.
+There is no R12-specific opcode fork.
+
+### Decoded outputs (typed `RingDecodedEvent` / `PulseEvent`)
+
+These are what PulseLoop *understands*. None of them are taps, swipes,
+or media keys.
+
+| Wire | PulseLoop event | Mentra controller use |
+| --- | --- | --- |
+| `0x03` battery; `0x73 0x0C` battery notify | `Battery(percent)` | Yes — `controllerBatteryLevel` |
+| `0x69` type 1 / `0x1E` | `HeartRateSample` | Ignore |
+| `0x69` type 3 | `Spo2Result` | Ignore |
+| `0x73 0x12` live activity (BE u24 steps/kcal/m) | `ActivityUpdate` | Ignore |
+| `0x15` / `0x37` / `0x39` / `0x43` history | HR / stress / HRV / steps history | Ignore |
+| `0xBC` big-data (sleep `0x27`, SpO₂ `0x2A`, temp) | `SleepTimeline`, history | Ignore |
+| `0x3C` device support | `supportBlePair`, `supportIntervalTemp` | Read, do **not** bond (R12 is GATT-only in PulseLoop; only R09/R11 set `requiresOsBond`) |
+| anything else with a valid checksum | `CommandAck(commandId)` | **This is where command 29 would land** |
+
+PulseLoop does **not** define opcodes for music (`0x1C`/`0x1D`), camera
+(`0x02`), or gestures. `DISPLAY_PREF` (`0x05`) is a constant only; the
+encoder never sends it. `ColmiCoordinator.capabilities` is HR / SpO₂ /
+steps / sleep / battery / stress / HRV / temp / find-device — no input
+surface.
+
+So we cannot “use PulseLoop’s gesture values.” They never decoded any.
+
+### Raw packet trace (this *is* usable)
+
+Every GATT notify is also stored as `RawPacketEntity`:
+
+```
+commandId  = first byte
+hexPayload = full 16-byte frame
+decodedKind = e.g. "command_ack" for unknown opcodes
+```
+
+Debug console: Settings → About → tap version 7× → Developer.
+Export: Settings → Privacy & Data → Export Diagnostics. Anonymize-on
+keeps non-health frames **whole** (`command_ack` is not in
+`HEALTH_KINDS`), so a media-panel tap would survive as hex starting
+`1d…` (id 29) even in a privacy-safe export.
+
+**Capture recipe (faster than nRF Connect if PulseLoop is already
+installed):** forget QRing, pair the R12 in PulseLoop, open the raw
+packet trace, use the OLED media panel, then grep the export for
+`"commandId": 29` or hex prefix `1d`. That log is the mapping table
+we need. Mentra still must be its own GATT client later — PulseLoop
+and Mentra cannot share the ring.
+
+### Protocol values we should copy (not health metrics)
+
+From `ColmiProtocol.kt` / `ColmiPacket.frame` / `ColmiEncoder` /
+`ColmiSyncEngine.runStartup` — already cross-checked against QRing:
+
+```
+UUIDs:  6e40fff0-… / write 6e400002-… / notify 6e400003-…
+Frame:  16 bytes, CRC = sum(bytes[0..14]) & 0xFF in byte[15]
+Name:   ^COLMI R12_.*
+Bond:   do not createBond() for R12
+```
+
+Minimum connect sequence PulseLoop sends (we can drop the health prefs):
+
+1. `0x04` phone name (`02 0A 'P' 'L'` in PulseLoop; Mentra can send `"Mentra"`)
+2. `0x01` set time, **including language byte** (0 = zh, 1 = en) — display
+   rings show the wrong locale without it
+3. `0x3C` device support (optional; tells us capability bits)
+4. `0x03` battery
+
+Do not enqueue PulseLoop’s auto-HR / stress / SpO₂ / HRV / temp / goals
+/ big-data sync. Those keep the radio busy and are unrelated to being a
+controller.
+
+Do not vendor PulseLoop as a dependency. Reimplement the ~20-line
+frame + those four commands in `ColmiR12Protocol.kt`.
+
+---
+
+## 4. The media panel is GATT, not HID
 
 ### What the ring sends (command 29)
 
@@ -160,7 +245,7 @@ controller.**
 
 ---
 
-## 4. Recommended mapping (v1)
+## 5. Recommended mapping (v1)
 
 Map command 29 onto the R1 gesture strings. Miniapps already subscribe
 to these; new strings are invisible.
@@ -190,7 +275,7 @@ No new Miniapp SDK stream. No cloud capability file.
 
 ---
 
-## 5. Mentra wiring (copy Keyfob, swap protocol)
+## 6. Mentra wiring (copy Keyfob, swap protocol)
 
 Follow `notes/adding-a-controller.md` (on `origin/s3-watch`; the
 checklist is the contract even if that branch is not merged).
@@ -278,14 +363,14 @@ glasses MAC). The R12 has no G2 pairing role.
 
 ---
 
-## 6. Risks and open items (need a ring on the desk)
+## 7. Risks and open items (need a ring on the desk)
 
 | Risk | Why it matters | Mitigation |
 | --- | --- | --- |
 | Music face silent unless QRing sent command 28 | v1 has no input | Bench: notify log with/without 28 |
 | Media actions are 5 enums, not raw swipe/tap | Mapping is lossy | Freeze v1 table after watching the OLED |
 | Exclusive GATT | QRing or system bond → Mentra scan finds nothing | Prep copy: forget in QRing and Android/iOS Bluetooth |
-| Name prefix unknown | Scan filter wrong | nRF Connect capture; matcher test |
+| Name prefix unknown | Scan filter wrong | **Resolved:** PulseLoop catalog `^COLMI R12_.*` |
 | iOS background | Ring drops when Mentra is suspended | Copy R1/Keyfob UUID reconnect + `bluetooth-central` background mode (already in the app) |
 | Vendor firmware change | Command 29 could move | Unofficial disclaimer; pin observed firmware version in logs |
 | Health noise | HR/step notifies on the same characteristic | Ignore non-29/3 packets |
@@ -295,7 +380,7 @@ glasses MAC). The R12 has no G2 pairing role.
 
 ---
 
-## 7. What we will not do
+## 8. What we will not do
 
 - Flash or reverse-engineer RTL8762 firmware.
 - Register a `MediaButtonReceiver` / `MPRemoteCommandCenter` steal.
@@ -306,20 +391,24 @@ glasses MAC). The R12 has no G2 pairing role.
 
 ---
 
-## 8. Bench checklist (do this before the driver PR)
+## 9. Bench checklist (do this before the driver PR)
 
-Physical R12 + nRF Connect (or a 20-line Python `bleak` script):
+Physical R12. Prefer PulseLoop’s Developer raw-packet trace if the app
+is already on the phone; otherwise nRF Connect or a small `bleak` script.
 
-1. Forget QRing. Confirm the ring advertises. Record the exact name.
+1. Forget QRing. Confirm advertise name `COLMI R12_<hex>`.
 2. Connect; list services. Confirm `6e40fff0-…` + notify char.
 3. Enable CCCD. Send command 3. Log battery.
 4. Navigate the OLED to the media panel. Tap / swipe / long-press.
    Save the notify hex. Expect `1d …` (29) with action 1–5.
+   In a PulseLoop diagnostics JSON: `"commandId": 29` / hex prefix `1d`,
+   `decodedKind` will be `command_ack` because PulseLoop does not parse it.
 5. Send command 28 (`isPlaying=1`, title Mentra). Repeat step 4. Note
    whether the face stays in music mode.
 6. Optional: camera face → command 2 `TAKE_PHOTO`.
 7. Disconnect, reconnect by address. Confirm notifies still flow.
 8. Repeat with glasses already connected to Mentra (radio coexistence).
+   PulseLoop cannot be connected at the same time.
 
 If step 4 never yields command 29, stop. Either the face is display-only
 until QRing enables it (fixable with 28 / another enable byte) or this
@@ -327,7 +416,7 @@ SKU does not emit music commands. That is the only feasibility killer.
 
 ---
 
-## 9. Recommendation
+## 10. Recommendation
 
 | Question | Answer |
 | --- | --- |
