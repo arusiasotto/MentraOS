@@ -8,12 +8,14 @@ owner: Arusia
 > Execution checklist. Update checkboxes as work lands. Prefer editing this file over re-pasting plans into chat.
 
 **Goal:** Mentra App pairs a Colmi R12 as a phone-only BLE controller and
-delivers R1-named `touch_event`s from the ring’s music face (GATT command
-29), without OS media-key intercept.
+delivers R1-named `touch_event`s from the ring’s music face (GATT `0x0B`
+leading, with `0x1D` as fallback), without OS media-key intercept.
 
 **Architecture:** Copy the XIAO Keyfob controller stack (`ControllerTypes` +
 GATT driver + `Bridge.sendTouchEvent` + pairing UI). Speak Yawell UART-over-BLE
-instead of the Keyfob frame. No firmware, no `sgcs/`, no Miniapp SDK change.
+using PulseLoop/QRing constants (UUIDs, 16-byte CRC, name `^COLMI R12_.*`),
+not the Keyfob frame. No firmware, no `sgcs/`, no Miniapp SDK change, no
+PulseLoop dependency.
 
 **Tech Stack:** Kotlin / Swift Bluetooth SDK, React Native pairing screens,
 existing `touch_event` path through `DeviceEventRouter` →
@@ -36,7 +38,7 @@ Current `dev` still special-cases R1.
 | `mobile/modules/bluetooth-sdk/android/.../utils/Constants.kt` | Modify | type + `ALL` |
 | `mobile/modules/bluetooth-sdk/ios/Source/utils/Constants.swift` | Modify | type + `ALL` |
 | `mobile/modules/bluetooth-sdk/.../types/DeviceModels.*` + `BluetoothSdk.types.ts` | Modify | display name maps |
-| `mobile/modules/bluetooth-sdk/android/.../controllers/colmi/ColmiR12Protocol.kt` | Create | UUIDs, CRC, cmd 28/29/3, name matcher, action → gesture |
+| `mobile/modules/bluetooth-sdk/android/.../controllers/colmi/ColmiR12Protocol.kt` | Create | UUIDs, CRC, cmd `0x0B`/`0x1D`/3/28, name matcher, action → gesture |
 | `mobile/modules/bluetooth-sdk/android/.../controllers/ColmiR12.kt` | Create | scan / GATT / notify / battery / reconnect |
 | `mobile/modules/bluetooth-sdk/ios/Source/controllers/ColmiR12.swift` | Create | iOS mirror |
 | `mobile/modules/bluetooth-sdk/android/.../DeviceManager.kt` | Modify | `initController` branch |
@@ -59,21 +61,22 @@ Current `dev` still special-cases R1.
 
 ## Phase 0: Hardware capture (gate)
 
-Do not start Phase 1 until command 29 is seen with Mentra (or nRF Connect /
-`bleak`) as the only central.
+Do not start Phase 1 until a leading `0x0B` (or `0x1D`) notify is seen
+with Mentra (or PulseLoop raw trace / nRF Connect / `bleak`) as the only
+central, and `bytes[1]` is recorded per gesture.
 
 - [ ] Forget QRing and system Bluetooth bond
 - [ ] Record advertised name (`COLMI R12_<hex>`, PulseLoop regex `^COLMI R12_.*`)
 - [ ] Confirm Yawell service + notify char
-- [ ] Optional: PulseLoop Developer raw-packet trace while using the media panel; grep export for commandId 29 / hex `1d`
+- [ ] Optional: PulseLoop Developer raw-packet trace while using the media panel; grep export for commandId 11 / hex `0b` (and 29 / `1d`)
 - [ ] Battery command 3
-- [ ] Media-panel taps/swipes → command 29 actions 1–5 (hex log)
+- [ ] Media-panel taps/swipes → leading `0x0B`, log action byte
 - [ ] Command 28 dummy now-playing: does the music face stay up?
 - [ ] Optional camera `TAKE_PHOTO`
 - [ ] Reconnect by address
 - [ ] Coexist with glasses GATT
 
-If command 29 never appears, stop and update the spec. That is the only
+If `0x0B` never appears, stop and update the spec. That is the only
 feasibility killer.
 
 ---
@@ -91,9 +94,9 @@ feasibility killer.
 
 **Files:** `ColmiR12Protocol.kt`, unit tests
 
-- [ ] UUIDs, 16-byte CRC, cmd 3/28/29
-- [ ] `matchesAdvertisedName` from Phase 0 capture
-- [ ] `MediaAction` → R1 gesture map from the spec (v1 table)
+- [ ] UUIDs, 16-byte CRC, cmd `0x0B` / `0x1D` / 3/28 (from PulseLoop `ColmiPacket` + colmi-docs + R12 `0x0B` leading)
+- [ ] `matchesAdvertisedName` = `^COLMI R12_.*` (PulseLoop `WearableModel.COLMI_R12`)
+- [ ] `MediaAction` / `bytes[1]` → R1 gesture map from the spec (v1 table)
 
 ### Task 3: Android driver
 

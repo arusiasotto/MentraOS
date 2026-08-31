@@ -10,18 +10,19 @@ No, if “intercept media keys in the Mentra App” means OS HID / AVRCP /
 `MediaSession` steal.**
 
 The ring’s media panel does not talk to Android or iOS as a keyboard or
-headset. It notifies a 16-byte Yawell GATT packet (command id 29). QRing
-turns that into system media keys. Mentra should skip QRing and consume
-command 29 itself, then emit the same `touch_event` strings miniapps already
-handle.
+headset. It notifies a 16-byte Yawell GATT packet whose **leading opcode
+on the R12 is `0x0B` (11)**. Older QRing docs call the same role command
+29 (`0x1D`). QRing turns that notify into system media keys. Mentra should
+skip QRing, consume `0x0B` (and `0x1D` if it also appears), then emit the
+same `touch_event` strings miniapps already handle.
 
 This is the same *role* as the XIAO nRF Keyfob (`origin/s3-watch`,
 `notes/adding-a-controller.md`). It is **not** the same *protocol*: we do
 not own R12 firmware.
 
-Hardware capture is still required before writing the driver. The protocol
-is public; whether the media face actually emits command 29 when Mentra is
-the only central is the remaining unknown.
+Hardware capture is still required before writing the driver: we need the
+bytes *after* `0x0B` (action / gesture) from a real R12. The leading opcode
+is treated as known.
 
 ---
 
@@ -111,13 +112,19 @@ or media keys.
 | `0x15` / `0x37` / `0x39` / `0x43` history | HR / stress / HRV / steps history | Ignore |
 | `0xBC` big-data (sleep `0x27`, SpO₂ `0x2A`, temp) | `SleepTimeline`, history | Ignore |
 | `0x3C` device support | `supportBlePair`, `supportIntervalTemp` | Read, do **not** bond (R12 is GATT-only in PulseLoop; only R09/R11 set `requiresOsBond`) |
-| anything else with a valid checksum | `CommandAck(commandId)` | **This is where command 29 would land** |
+| anything else with a valid checksum | `CommandAck(commandId)` | **This is where R12 media-panel `0x0B` (and legacy `0x1D`) would land** |
 
-PulseLoop does **not** define opcodes for music (`0x1C`/`0x1D`), camera
-(`0x02`), or gestures. `DISPLAY_PREF` (`0x05`) is a constant only; the
-encoder never sends it. `ColmiCoordinator.capabilities` is HR / SpO₂ /
-steps / sleep / battery / stress / HRV / temp / find-device — no input
-surface.
+PulseLoop does **not** define Colmi opcodes for music (`0x0B` / `0x1C` /
+`0x1D`), camera (`0x02`), or gestures. `DISPLAY_PREF` (`0x05`) is a
+constant only; the encoder never sends it. `ColmiCoordinator.capabilities`
+is HR / SpO₂ / steps / sleep / battery / stress / HRV / temp / find-device
+— no input surface.
+
+**Do not confuse PulseLoop `0x0B`.** In PulseLoop that opcode is
+**jring / 56ff battery** (`RingDecoder.decodeBattery`), a different
+20-byte KeepFit packet. Colmi frames are 16 bytes on the Yawell UART.
+An R12 media notify that starts `0B …` will show up in PulseLoop’s Colmi
+path as `command_ack` with `commandId: 11`.
 
 So we cannot “use PulseLoop’s gesture values.” They never decoded any.
 
@@ -135,13 +142,14 @@ Debug console: Settings → About → tap version 7× → Developer.
 Export: Settings → Privacy & Data → Export Diagnostics. Anonymize-on
 keeps non-health frames **whole** (`command_ack` is not in
 `HEALTH_KINDS`), so a media-panel tap would survive as hex starting
-`1d…` (id 29) even in a privacy-safe export.
+`0b…` (id 11) even in a privacy-safe export.
 
 **Capture recipe (faster than nRF Connect if PulseLoop is already
 installed):** forget QRing, pair the R12 in PulseLoop, open the raw
 packet trace, use the OLED media panel, then grep the export for
-`"commandId": 29` or hex prefix `1d`. That log is the mapping table
-we need. Mentra still must be its own GATT client later — PulseLoop
+`"commandId": 11` / hex prefix `0b` (R12 media panel) and also
+`"commandId": 29` / `1d` (legacy QRing music). That log is the mapping
+table we need. Mentra still must be its own GATT client later — PulseLoop
 and Mentra cannot share the ring.
 
 ### Protocol values we should copy (not health metrics)
@@ -175,18 +183,31 @@ frame + those four commands in `ColmiR12Protocol.kt`.
 
 ## 4. The media panel is GATT, not HID
 
-### What the ring sends (command 29)
+### What the ring sends (`0x0B` leading)
 
-When the user uses the on-ring **music** UI, the ring notifies:
+R12 media-panel notifies are expected to start with **`0x0B`** as the
+Yawell command id (first of the 16 payload bytes, not an ATT opcode).
+
+That slot is a hole in the published Oudmon/QRing enum
+([ATC_RF03 #13](https://github.com/atc1441/ATC_RF03_Ring/issues/13)):
+the dump jumps from `CMD_GET_TIME_SETTING = 10` (`0x0A`) to
+`CMD_BP_TIMING_MONITOR_SWITCH = 12` (`0x0C`). colmi-docs has the same
+gap (settings id 10 then 12). A later display-touch firmware adding
+command 11 for the OLED media face is the straightforward explanation.
 
 ```c
-struct MusicCommandResponse {   // commandId = 29
-    uint8_t commandId;          // 29
-    uint8_t action;             // MediaAction
-    char unused[13];
+struct R12MediaPanelNotify {    // leading opcode 0x0B
+    uint8_t commandId;          // 0x0B
+    uint8_t action;             // layout unconfirmed — see below
+    char rest[13];
     uint8_t crc;
 };
+```
 
+**Action byte is not yet captured.** Until a hex dump exists, try the
+same `MediaAction` enum QRing uses on command 29, in `bytes[1]`:
+
+```c
 enum MediaAction {
     Pause       = 1,
     Previous    = 2,
@@ -196,20 +217,27 @@ enum MediaAction {
 };
 ```
 
-The phone can also **push** now-playing onto the ring (command 28:
-playing / progress / volume / 10-char title). QRing does that so the
-face looks like a media control panel. Mentra can send a dummy
-“Mentra” title so the face stays in music mode without a real player.
+Also accept **legacy command 29 (`0x1D`)** with that same action byte.
+colmi-docs and the Oudmon list still document:
 
-Related, not media keys:
-
-| Command | Direction | Use for a controller |
+| Command | Direction | Role on R12 |
 | --- | --- | --- |
-| 28 Music Switch | phone → ring | Keep / enable the music face |
-| 29 Music | ring → phone | **Primary input** |
-| 2 Camera | both | Shutter (`TAKE_PHOTO = 2`) as another tap |
-| 3 Battery | both | `controllerBatteryLevel` |
-| 2 / `0x0204` wave-gesture | phone → ring | TikTok-style wave; Gadgetbridge still lists camera/wave as missing — do not depend on it for v1 |
+| **`0x0B` (11)** | ring → phone | **Primary: R12 media-panel leading opcode** |
+| `0x1D` (29) Music | ring → phone | Fallback if firmware still emits the old music cmd |
+| `0x1C` (28) Music Switch | phone → ring | May still be needed to pin the music face |
+| `0x02` Camera | both | Shutter (`TAKE_PHOTO = 2`) as another tap |
+| `0x03` Battery | both | `controllerBatteryLevel` |
+
+Not the same `0x0B`:
+
+- ATT **Read Response** PDUs also start `0x0B` in a BTSnoop HCI view.
+  Mentra’s GATT callback already delivers the *characteristic value*,
+  which should start with the Yawell id, not the ATT opcode.
+- PulseLoop **jring** `0x0B` is battery on a 20-byte KeepFit frame.
+
+The phone can also **push** now-playing onto the ring (command 28:
+playing / progress / volume / 10-char title). Try that if the OLED
+leaves the media face without a dummy `"Mentra"` title.
 
 ### Why OS-level intercept fails
 
@@ -220,7 +248,7 @@ needs the ring (or QRing) to inject `KEYCODE_MEDIA_*` / AVRCP into the OS.
    BLE HOGP, no classic AVRCP. nRF Connect and Gadgetbridge only show
    the Yawell services above.
 2. **QRing is the HID synthesizer.** It holds the GATT session, reads
-   command 29, then dispatches media keys. Mentra cannot be that
+   `0x0B` / command 29, then dispatches media keys. Mentra cannot be that
    central at the same time: these rings are single-central in practice
    (“cannot be paired to other devices or it cannot be discovered”).
 3. **Android will not give Mentra those keys anyway.** From Android 8,
@@ -247,8 +275,8 @@ controller.**
 
 ## 5. Recommended mapping (v1)
 
-Map command 29 onto the R1 gesture strings. Miniapps already subscribe
-to these; new strings are invisible.
+Map `0x0B` (and fallback `0x1D`) onto the R1 gesture strings. Miniapps
+already subscribe to these; new strings are invisible.
 
 Proposed v1 (product can swap after a bench test of the actual face):
 
@@ -298,7 +326,7 @@ New files (mirror Keyfob):
 
 - `controllers/ColmiR12.kt` / `ColmiR12.swift`
 - `controllers/colmi/ColmiR12Protocol.kt` (UUIDs, CRC, command ids, name matcher, action → gesture)
-- Unit tests for CRC, command 29 decode, name prefix
+- Unit tests for CRC, `0x0B` (and `0x1D`) decode, name prefix
 - Pairing UI: `select-controller.tsx`, `prep-controller.tsx`, `success.tsx`, i18n, image
 
 `DeviceManager.initController`:
@@ -342,7 +370,8 @@ Minimum to try on the bench:
 3. Command 1 (set time) — many rings want this after connect.
 4. Command 28 with `isPlaying=1`, dummy title `"Mentra"` — try to pin
    the music face.
-5. Subscribe; log every 16-byte notify. Confirm id 29 on tap/swipe.
+5. Subscribe; log every 16-byte notify. Confirm leading `0x0B` on tap/swipe
+   (also log `0x1D` if present).
 
 Heartbeat: R1/Keyfob ping; R12 may need periodic command 3 or 28 so the
 ring does not drop the music face. Measure idle timeout on device.
@@ -372,8 +401,8 @@ glasses MAC). The R12 has no G2 pairing role.
 | Exclusive GATT | QRing or system bond → Mentra scan finds nothing | Prep copy: forget in QRing and Android/iOS Bluetooth |
 | Name prefix unknown | Scan filter wrong | **Resolved:** PulseLoop catalog `^COLMI R12_.*` |
 | iOS background | Ring drops when Mentra is suspended | Copy R1/Keyfob UUID reconnect + `bluetooth-central` background mode (already in the app) |
-| Vendor firmware change | Command 29 could move | Unofficial disclaimer; pin observed firmware version in logs |
-| Health noise | HR/step notifies on the same characteristic | Ignore non-29/3 packets |
+| Vendor firmware change | Opcode could move off `0x0B` | Unofficial disclaimer; pin observed firmware version in logs; also match `0x1D` |
+| Health noise | HR/step notifies on the same characteristic | Ignore non-`0x0B`/`0x1D`/`0x03` packets |
 | Camera face vs music face | User must be on the right OLED screen | Prep guide: open the media panel |
 | Wave / TikTok gesture | Marketing feature, poorly documented | Out of v1 |
 | `dev` vs `s3-watch` | Keyfob identity plumbing not on `dev` | Implement R12 on top of that plumbing, or duplicate the ALL/`projectTargetReady` fixes |
@@ -400,8 +429,9 @@ is already on the phone; otherwise nRF Connect or a small `bleak` script.
 2. Connect; list services. Confirm `6e40fff0-…` + notify char.
 3. Enable CCCD. Send command 3. Log battery.
 4. Navigate the OLED to the media panel. Tap / swipe / long-press.
-   Save the notify hex. Expect `1d …` (29) with action 1–5.
-   In a PulseLoop diagnostics JSON: `"commandId": 29` / hex prefix `1d`,
+   Save the notify hex. Expect **`0b …` (11)** as the leading byte.
+   Also record any `1d …` (29). Note `bytes[1]` per gesture.
+   In a PulseLoop diagnostics JSON: `"commandId": 11` / hex prefix `0b`,
    `decodedKind` will be `command_ack` because PulseLoop does not parse it.
 5. Send command 28 (`isPlaying=1`, title Mentra). Repeat step 4. Note
    whether the face stays in music mode.
@@ -410,9 +440,11 @@ is already on the phone; otherwise nRF Connect or a small `bleak` script.
 8. Repeat with glasses already connected to Mentra (radio coexistence).
    PulseLoop cannot be connected at the same time.
 
-If step 4 never yields command 29, stop. Either the face is display-only
-until QRing enables it (fixable with 28 / another enable byte) or this
-SKU does not emit music commands. That is the only feasibility killer.
+If step 4 never yields a leading `0x0B` (or `0x1D`), stop. Either the
+face is display-only until QRing enables it (fixable with command 28 /
+another enable byte) or this SKU does not emit media-panel commands.
+That is the only feasibility killer. The remaining unknown is the
+**action byte** after `0x0B`, not the leading opcode.
 
 ---
 
@@ -424,7 +456,7 @@ SKU does not emit music commands. That is the only feasibility killer.
 | Feasible via OS media-key intercept? | **No** |
 | Firmware work? | None |
 | Miniapp API changes? | None if we stick to R1 gesture names |
-| Blocked on? | One hardware capture of command 29 |
+| Blocked on? | One hex dump of `0x0B` + action byte from a real R12 media-panel tap |
 | Suggested first PR after capture | Protocol object + Android driver + pairing row; iOS in the same PR if the capture is unambiguous |
 | Product status | Unofficial, same disclaimer style as Keyfob |
 
