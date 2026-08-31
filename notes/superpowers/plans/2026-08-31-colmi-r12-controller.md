@@ -61,20 +61,22 @@ Current `dev` still special-cases R1.
 
 ## Phase 0: Hardware capture (gate)
 
+Get an R12. Start with nRF Connect notify logs on `6e400003-…` (or Android
+HCI snoop + Wireshark). A dedicated nRF USB sniffer is optional. See spec
+§9 for the labelled takes.
+
 Do not start Phase 1 until a leading `0x0B` (or `0x1D`) notify is seen
-with Mentra (or PulseLoop raw trace / nRF Connect / `bleak`) as the only
-central, and `bytes[1]` is recorded per gesture.
+with one central only, and `bytes[1]` is recorded per gesture.
 
 - [ ] Forget QRing and system Bluetooth bond
 - [ ] Record advertised name (`COLMI R12_<hex>`, PulseLoop regex `^COLMI R12_.*`)
-- [ ] Confirm Yawell service + notify char
-- [ ] Optional: PulseLoop Developer raw-packet trace while using the media panel; grep export for commandId 11 / hex `0b` (and 29 / `1d`)
+- [ ] HCI snoop or nRF Connect notify log on `6e400003-…`
 - [ ] Battery command 3
-- [ ] Media-panel taps/swipes → leading `0x0B`, log action byte
-- [ ] Command 28 dummy now-playing: does the music face stay up?
+- [ ] Media-panel tap / swipe / hold — leading `0x0B`, log action byte (3× each)
+- [ ] Repeat after command 28 dummy now-playing
 - [ ] Optional camera `TAKE_PHOTO`
 - [ ] Reconnect by address
-- [ ] Coexist with glasses GATT
+- [ ] Optional: coexist with glasses GATT
 
 If `0x0B` never appears, stop and update the spec. That is the only
 feasibility killer.
@@ -105,7 +107,7 @@ feasibility killer.
 - [ ] Scan, connect, CCCD, init (time + music switch + battery)
 - [ ] Notify → `Bridge.sendTouchEvent`
 - [ ] Both connected flags; persist address; reconnect
-- [ ] Ignore non-29/3 packets on the notify char
+- [ ] Ignore non-`0x0B`/`0x1D`/`0x03` packets on the notify char
 
 ---
 

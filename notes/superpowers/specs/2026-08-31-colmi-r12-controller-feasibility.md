@@ -22,7 +22,8 @@ not own R12 firmware.
 
 Hardware capture is still required before writing the driver: we need the
 bytes *after* `0x0B` (action / gesture) from a real R12. The leading opcode
-is treated as known.
+is treated as known. Buy the ring; sniff with Android HCI snoop or nRF
+Connect. A dedicated nRF USB sniffer is optional. See §9.
 
 ---
 
@@ -422,29 +423,80 @@ glasses MAC). The R12 has no G2 pairing role.
 
 ## 9. Bench checklist (do this before the driver PR)
 
-Physical R12. Prefer PulseLoop’s Developer raw-packet trace if the app
-is already on the phone; otherwise nRF Connect or a small `bleak` script.
+Buy an R12. A dedicated sniffer is useful; it is not required.
 
-1. Forget QRing. Confirm advertise name `COLMI R12_<hex>`.
-2. Connect; list services. Confirm `6e40fff0-…` + notify char.
-3. Enable CCCD. Send command 3. Log battery.
-4. Navigate the OLED to the media panel. Tap / swipe / long-press.
-   Save the notify hex. Expect **`0b …` (11)** as the leading byte.
-   Also record any `1d …` (29). Note `bytes[1]` per gesture.
-   In a PulseLoop diagnostics JSON: `"commandId": 11` / hex prefix `0b`,
-   `decodedKind` will be `command_ack` because PulseLoop does not parse it.
-5. Send command 28 (`isPlaying=1`, title Mentra). Repeat step 4. Note
-   whether the face stays in music mode.
-6. Optional: camera face → command 2 `TAKE_PHOTO`.
-7. Disconnect, reconnect by address. Confirm notifies still flow.
-8. Repeat with glasses already connected to Mentra (radio coexistence).
-   PulseLoop cannot be connected at the same time.
+**Fastest (recommended first):** nRF Connect. Scan `COLMI R12_*`, connect,
+enable notify on `6e400003-…`, log every notification while using the
+media panel. You get the 16-byte *value* with no ATT-opcode confusion.
+PulseLoop Developer raw-packet trace also works (`commandId` 11 / hex
+`0b`); it will label the frame `command_ack` because it does not parse
+media.
 
-If step 4 never yields a leading `0x0B` (or `0x1D`), stop. Either the
-face is display-only until QRing enables it (fixable with command 28 /
-another enable byte) or this SKU does not emit media-panel commands.
-That is the only feasibility killer. The remaining unknown is the
-**action byte** after `0x0B`, not the leading opcode.
+**Also enough:** Android Developer Options → **Enable Bluetooth HCI snoop
+log**. Reproduce the gestures, then:
+
+```
+adb bugreport /tmp/r12-snoop
+```
+
+Unzip the bugreport and open `btsnoop_hci.log` (often under
+`FS/data/misc/bluetooth/logs/`). Older phones also write
+`/sdcard/btsnoop_hci.log`. Wireshark filter:
+
+```
+btatt.handle_value_notification && bluetoothuuid == 6e400003-b5a3-f393-e0a9-e50e24dcca9e
+```
+
+You want the 16-byte *value*, not the ATT opcode. Leading `0x0B` here is
+Yawell. Leading `0x0B` on the HCI ATT layer is a Read Response — ignore
+those.
+
+**Nice to have:** nRF52840 USB dongle running Nordic’s BLE sniffer
+(Wireshark). Use it if you also want advertising name, scan responses,
+reconnect, and empty-packet timing, or if a phone central is hiding
+frames. Do not start with Ellisys-class gear.
+
+### Isolation
+
+1. Uninstall or force-stop QRing. Forget the ring in Android/iOS Bluetooth.
+2. One central only (nRF Connect *or* PulseLoop *or* Mentra).
+3. Wake the ring (off charger, tap the OLED).
+
+### Labelled takes (one snoop file each, or a voiced timestamp)
+
+Do each gesture three times. Write down wall-clock time next to the action.
+
+| Take | What you do | What to record |
+| --- | --- | --- |
+| A | Scan only | Advertised name (`COLMI R12_<hex>`), RSSI |
+| B | Connect, enable notify, send `0x03` | Battery frame |
+| C | Open **media panel**, tap | Full 16-byte notify |
+| D | Media panel swipe one way | Full 16-byte notify |
+| E | Media panel swipe the other way | Full 16-byte notify |
+| F | Media panel long-press / hold | Full 16-byte notify |
+| G | Repeat C–F after writing command 28 (`isPlaying=1`, title Mentra) | Does `0x0B` start, or change? |
+| H | Camera face shutter, if present | Command `0x02`? |
+| I | Disconnect / reconnect by address | Still getting C–F? |
+
+Fill:
+
+```
+gesture | time | hex (16 bytes) | leading | byte[1]
+tap     |      |                | 0b?     |
+swipe A |      |                |         |
+swipe B |      |                |         |
+hold    |      |                |         |
+```
+
+That table is the decoder. `byte[1]` is the remaining unknown. Paste it
+back into this spec before starting the driver PR.
+
+If C–F never yield leading `0x0B` (or `0x1D`), stop. Either the face is
+display-only until something like command 28 enables it, or this SKU does
+not emit media-panel commands. That is the only feasibility killer.
+
+Optional later: same takes with glasses already connected to Mentra (radio
+coexistence). PulseLoop cannot be connected at the same time.
 
 ---
 
