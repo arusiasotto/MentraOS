@@ -42,3 +42,7 @@ Any plan that will span multiple chat sessions should be saved as a file under `
 ## Other content under `notes/`
 
 Architecture notes, bluetooth-sdk subsystem docs, OTA specs, and related material also live under `notes/` (and under `agents/` for agent scratchpads). Use the superpowers layout above for **new** multi-session implementation plans.
+
+Recent feasibility notes:
+
+- Colmi R12 as a Mentra controller (GATT music-face, not OS media-key intercept): [superpowers/specs/2026-08-31-colmi-r12-controller-feasibility.md](superpowers/specs/2026-08-31-colmi-r12-controller-feasibility.md)
