@@ -27,6 +27,8 @@ pio device monitor
 Board package: ESP32-S3 with OPI PSRAM. If your Waveshare kit uses 32 MB flash,
 set `board_upload.flash_size = 32MB` in `platformio.ini`.
 
+Wearer controls and features: [`CONTROLS.md`](CONTROLS.md).
+
 ## v1 features
 
 - Full-screen UTF-8 text
@@ -34,4 +36,8 @@ set `board_upload.flash_size = 32MB` in `platformio.ini`.
 - Brightness
 - 16 kHz 16-bit mono PCM mic (ES7210 + I2S) when the phone sends `MIC_ENABLE`
 - Capacitive gestures (FT3168): swipe up/down, tap, double tap, long press
-- Battery notify is a stub (`100%`) until AXP2101 is wired
+- Display sleeps after 30s idle. The S3 then light-sleeps with BLE still up so Mentra stays connected and can push notification JPEGs. Wake on tap, PWR, BOOT, or a GATT write. Mic / in-flight JPEG keep it awake.
+- Short PWR tap: G2-style app menu (swipe to move, tap to toggle). Hold PWR ~1s to sleep. Hardware still offs at ~6s.
+- Top BOOT button: wake, or dismiss the menu / a HUD card back to the watch face. Hold ~0.7s to cycle HUD color (green / amber / red / white / cyan). Hold BOOT at power-on still enters download.
+- AXP2101 battery percent on the watch face and via BLE (`0%` when no cell is present)
+- Short speaker beep when a JPEG card replaces the idle face (notifications; not Captions frames)

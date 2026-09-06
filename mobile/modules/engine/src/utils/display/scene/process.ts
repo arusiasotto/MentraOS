@@ -74,6 +74,11 @@ export function processScene(
   const measurer = new TextMeasurer(profile)
   const wrapper = new TextWrapper(measurer)
   const lineHeight = profileLineHeightPx(profile, caps.height)
+  // Devices that accept G2-hardcoded boxes clamp against 576×288 as well
+  // as their public canvas, so a 288×288 test bitmap is kept (not dropped)
+  // and the SGC scales that frame.
+  const clampW = caps.fitOverflowImages ? Math.max(caps.width, 576) : caps.width
+  const clampH = caps.fitOverflowImages ? Math.max(caps.height, 288) : caps.height
 
   // Validate + dedupe explicit ids (first occurrence wins; dupes are dev error).
   const seenIds = new Set<string>()
@@ -114,7 +119,7 @@ export function processScene(
   const out: DiffableElement[] = []
 
   for (const {el, index} of valid) {
-    const clamped = clampBox(el.box, caps.width, caps.height)
+    const clamped = clampBox(el.box, clampW, clampH)
     if (!clamped) {
       dropped.push(reportId(el, index))
       degraded = true

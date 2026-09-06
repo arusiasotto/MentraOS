@@ -187,8 +187,8 @@ export function DeviceSettingsSection() {
         />
       )}
 
-      {/* Glasses Menu — G2 only, requires connection */}
-      {defaultWearable === DeviceTypes.G2 && glassesConnected && (
+      {/* Glasses Menu — G2 dashboard / S3 Watch PWR menu */}
+      {(defaultWearable === DeviceTypes.G2 || defaultWearable === DeviceTypes.S3_WATCH) && glassesConnected && (
         <RouteButton
           icon={<Icon name="menu-2" size={24} color={theme.colors.secondary_foreground} />}
           label={translate("settings:glassesMenu")}

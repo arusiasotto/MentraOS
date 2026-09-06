@@ -21,6 +21,9 @@ import android.graphics.RectF
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.text.Layout
+import android.text.StaticLayout
+import android.text.TextPaint
 import android.util.Base64
 import com.mentra.bluetoothsdk.Bridge
 import com.mentra.bluetoothsdk.DeviceManager
@@ -42,6 +45,7 @@ class S3Watch : SGCManager() {
     companion object {
         private const val TAG = "S3Watch"
         private const val SCAN_DURATION_MS = 15_000L
+        private const val JPEG_ACK_TIMEOUT_MS = 800L
 
         @JvmStatic
         fun matchesAdvertisedName(name: String?): Boolean = S3WatchProtocol.matchesAdvertisedName(name)
@@ -68,9 +72,21 @@ class S3Watch : SGCManager() {
     private var notifyWriteInFlight = false
     private val writeQueue: ArrayDeque<WriteOp> = ArrayDeque()
     private var writeInFlight = false
+    private var currentOp: WriteOp? = null
+    private var pendingJpeg: ByteArray? = null
+    private var jpegTransferActive = false
+    private val pendingControls: ArrayDeque<WriteOp> = ArrayDeque()
+    private val jpegAckTimeout =
+        Runnable {
+            Bridge.log("$TAG: JPEG blit ack timed out")
+            finishJpegTransfer()
+        }
     private var seq = 1
     private var negotiatedMtu = 23
     private var pcmPackets = 0
+    private var dashboardMenuItems: List<S3WatchProtocol.MenuEntry> = emptyList()
+    private var dashboardMenuPackages: List<String> = emptyList()
+    private var lastMenuSelectMs = 0L
 
     init {
         type = DeviceTypes.S3_WATCH
@@ -84,7 +100,11 @@ class S3Watch : SGCManager() {
         enqueueControl(S3WatchProtocol.CMD_MIC_ENABLE, byteArrayOf(if (enabled) 1 else 0))
     }
 
-    override fun sortMicRanking(list: MutableList<String>): MutableList<String> = list
+    override fun sortMicRanking(list: MutableList<String>): MutableList<String> {
+        val glasses = list.filter { it.contains("glasses", ignoreCase = true) }
+        val rest = list.filterNot { it.contains("glasses", ignoreCase = true) }
+        return (glasses + rest).toMutableList()
+    }
 
     override fun requestPhoto(request: PhotoRequest) {
         Bridge.log("$TAG: requestPhoto not supported")
@@ -138,10 +158,46 @@ class S3Watch : SGCManager() {
         width: Int?,
         height: Int?,
     ): Boolean {
-        val jpeg = decodeToJpeg(base64ImageData) ?: return false
-        Bridge.log("$TAG: displayBitmap jpeg=${jpeg.size}")
+        val jpeg = decodeToJpeg(base64ImageData, x, y, width, height) ?: return false
+        Bridge.log("$TAG: displayBitmap jpeg=${jpeg.size} pos=$x,$y ${width}x$height")
         sendJpeg(jpeg)
         return true
+    }
+
+    override fun sendPositionedText(
+        text: String,
+        x: Int,
+        y: Int,
+        width: Int,
+        height: Int,
+        borderWidth: Int,
+        borderRadius: Int,
+    ) {
+        applySceneFrame(
+            SceneFrame(
+                appId = "legacy",
+                epoch = 0,
+                replay = true,
+                elements =
+                    listOf(
+                        SceneElement(
+                            id = "pos",
+                            type = "text",
+                            x = x,
+                            y = y,
+                            w = width,
+                            h = height,
+                            text = text,
+                            data = null,
+                            border = borderWidth,
+                            radius = borderRadius,
+                            change = "created",
+                            contentHash = "",
+                        ),
+                    ),
+                removed = emptyList(),
+            ),
+        )
     }
 
     override fun applySceneFrame(frame: SceneFrame) {
@@ -151,6 +207,21 @@ class S3Watch : SGCManager() {
     }
 
     override fun showDashboard() {}
+
+    override fun setDashboardMenu(items: List<Map<String, Any>>) {
+        val parsed =
+            items.mapNotNull { dict ->
+                val packageName = dict["packageName"] as? String ?: return@mapNotNull null
+                val name = dict["name"] as? String ?: return@mapNotNull null
+                val running = dict["running"] as? Boolean ?: false
+                Triple(packageName, name, running)
+            }
+        dashboardMenuPackages = parsed.map { it.first }
+        dashboardMenuItems =
+            parsed.map { S3WatchProtocol.MenuEntry(running = it.third, name = it.second) }
+        Bridge.log("$TAG: setDashboardMenu ${dashboardMenuItems.size} items")
+        enqueueControl(S3WatchProtocol.CMD_MENU, S3WatchProtocol.encodeMenu(dashboardMenuItems))
+    }
 
     override fun setDashboardPosition(height: Int, depth: Int) {}
 
@@ -251,13 +322,16 @@ class S3Watch : SGCManager() {
     override fun sendHotspotState(enabled: Boolean) {}
 
     override fun sendSetSystemTime(timestampMs: Long) {
-        val seconds = (timestampMs / 1000L).toInt()
+        val seconds = timestampMs / 1000L
+        val offsetMin = java.util.TimeZone.getDefault().getOffset(timestampMs) / 60_000
         val payload =
             byteArrayOf(
                 (seconds and 0xFF).toByte(),
                 ((seconds shr 8) and 0xFF).toByte(),
                 ((seconds shr 16) and 0xFF).toByte(),
                 ((seconds shr 24) and 0xFF).toByte(),
+                (offsetMin and 0xFF).toByte(),
+                ((offsetMin shr 8) and 0xFF).toByte(),
             )
         enqueueControl(S3WatchProtocol.CMD_TIME_SYNC, payload)
     }
@@ -361,6 +435,7 @@ class S3Watch : SGCManager() {
                     updateConnectionState(ConnTypes.DISCONNECTED)
                     DeviceStore.apply("glasses", "connected", false)
                     DeviceStore.apply("glasses", "fullyBooted", false)
+                    DeviceStore.apply("glasses", "micEnabled", false)
                 }
             }
 
@@ -413,8 +488,14 @@ class S3Watch : SGCManager() {
                 status: Int,
             ) {
                 writeInFlight = false
+                val finished = currentOp
+                currentOp = null
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     Bridge.log("$TAG: characteristic write failed status=$status")
+                }
+                if (finished?.endsJpeg == true) {
+                    handler.removeCallbacks(jpegAckTimeout)
+                    handler.postDelayed(jpegAckTimeout, JPEG_ACK_TIMEOUT_MS)
                 }
                 pumpWrites()
             }
@@ -479,7 +560,25 @@ class S3Watch : SGCManager() {
         DeviceStore.apply("glasses", "deviceModel", type)
         updateConnectionState(ConnTypes.CONNECTED)
         sendSetSystemTime(System.currentTimeMillis())
+        sendStoredMenu()
+        // Idle watch light-sleeps; LOW_POWER after the first JPEG burst.
+        setLinkPriority(android.bluetooth.BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
         handler.post { pumpWrites() }
+    }
+
+    private fun setLinkPriority(priority: Int) {
+        try {
+            gatt?.requestConnectionPriority(priority)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun sendStoredMenu() {
+        @Suppress("UNCHECKED_CAST")
+        val items = DeviceStore.get("bluetooth", "menu_apps") as? List<Map<String, Any>> ?: return
+        if (items.isNotEmpty()) {
+            setDashboardMenu(items)
+        }
     }
 
     private fun handleEvent(packet: ByteArray) {
@@ -492,12 +591,31 @@ class S3Watch : SGCManager() {
                     DeviceStore.apply("glasses", "batteryLevel", percent.coerceIn(0, 100))
                 }
             }
+            S3WatchProtocol.EVT_ACK -> {
+                if (payload.size >= 1 && payload[0] == S3WatchProtocol.CMD_IMG_END) {
+                    handler.post { finishJpegTransfer() }
+                }
+            }
             S3WatchProtocol.EVT_READY -> markReady()
             S3WatchProtocol.EVT_GESTURE -> {
                 if (payload.isEmpty()) return
                 val name = S3WatchProtocol.gestureName(payload[0]) ?: return
                 Bridge.log("$TAG: gesture $name")
+                when (name) {
+                    "swipe_up" -> DeviceStore.apply("glasses", "headUp", true)
+                    "swipe_down" -> DeviceStore.apply("glasses", "headUp", false)
+                }
                 Bridge.sendTouchEvent(type, name, System.currentTimeMillis())
+            }
+            S3WatchProtocol.EVT_MENU_SELECT -> {
+                if (payload.isEmpty()) return
+                val now = System.currentTimeMillis()
+                if (now - lastMenuSelectMs < 500) return
+                lastMenuSelectMs = now
+                val index = payload[0].toInt() and 0xFF
+                val packageName = dashboardMenuPackages.getOrNull(index) ?: return
+                Bridge.log("$TAG: menu select $packageName")
+                Bridge.sendMiniappSelected(packageName)
             }
             else -> {}
         }
@@ -505,12 +623,47 @@ class S3Watch : SGCManager() {
 
     private fun enqueueControl(opcode: Byte, payload: ByteArray = ByteArray(0)) {
         handler.post {
-            writeQueue.add(WriteOp(S3WatchProtocol.CTRL_UUID, encodeControl(opcode, payload), false))
-            pumpWrites()
+            val op = WriteOp(S3WatchProtocol.CTRL_UUID, encodeControl(opcode, payload), false)
+            // Mic must not wait for a JPEG blit ACK. Captions turns the mic
+            // on while the first HUD frame is still in flight; parking the
+            // command in pendingControls left the watch silent.
+            if (jpegTransferActive && opcode != S3WatchProtocol.CMD_MIC_ENABLE) {
+                pendingControls.add(op)
+            } else {
+                writeQueue.add(op)
+                pumpWrites()
+            }
         }
     }
 
     private fun sendJpeg(jpeg: ByteArray) {
+        handler.post {
+            pendingJpeg = jpeg
+            if (!jpegTransferActive) {
+                enqueuePendingJpeg()
+            }
+        }
+    }
+
+    private fun finishJpegTransfer() {
+        handler.removeCallbacks(jpegAckTimeout)
+        if (!jpegTransferActive) return
+        jpegTransferActive = false
+        while (pendingControls.isNotEmpty()) {
+            writeQueue.add(pendingControls.removeFirst())
+        }
+        enqueuePendingJpeg()
+        if (!jpegTransferActive) {
+            setLinkPriority(android.bluetooth.BluetoothGatt.CONNECTION_PRIORITY_LOW_POWER)
+        }
+        pumpWrites()
+    }
+
+    private fun enqueuePendingJpeg() {
+        val jpeg = pendingJpeg ?: return
+        pendingJpeg = null
+        jpegTransferActive = true
+        setLinkPriority(android.bluetooth.BluetoothGatt.CONNECTION_PRIORITY_HIGH)
         val begin =
             byteArrayOf(
                 (jpeg.size and 0xFF).toByte(),
@@ -522,18 +675,18 @@ class S3Watch : SGCManager() {
                 (S3WatchProtocol.DISPLAY_HEIGHT and 0xFF).toByte(),
                 ((S3WatchProtocol.DISPLAY_HEIGHT shr 8) and 0xFF).toByte(),
             )
-        handler.post {
-            writeQueue.add(WriteOp(S3WatchProtocol.CTRL_UUID, encodeControl(S3WatchProtocol.CMD_IMG_BEGIN, begin), false))
-            val chunkSize = (negotiatedMtu - 3).coerceIn(20, 180)
-            var offset = 0
-            while (offset < jpeg.size) {
-                val end = (offset + chunkSize).coerceAtMost(jpeg.size)
-                writeQueue.add(WriteOp(S3WatchProtocol.IMG_UUID, jpeg.copyOfRange(offset, end), noResponse = true))
-                offset = end
-            }
-            writeQueue.add(WriteOp(S3WatchProtocol.CTRL_UUID, encodeControl(S3WatchProtocol.CMD_IMG_END), false))
-            pumpWrites()
+        writeQueue.add(WriteOp(S3WatchProtocol.CTRL_UUID, encodeControl(S3WatchProtocol.CMD_IMG_BEGIN, begin), false))
+        val chunkSize = (negotiatedMtu - 3).coerceIn(20, 180)
+        var offset = 0
+        while (offset < jpeg.size) {
+            val end = (offset + chunkSize).coerceAtMost(jpeg.size)
+            writeQueue.add(WriteOp(S3WatchProtocol.IMG_UUID, jpeg.copyOfRange(offset, end), noResponse = true))
+            offset = end
         }
+        writeQueue.add(
+            WriteOp(S3WatchProtocol.CTRL_UUID, encodeControl(S3WatchProtocol.CMD_IMG_END), false, endsJpeg = true),
+        )
+        pumpWrites()
     }
 
     private fun encodeControl(opcode: Byte, payload: ByteArray = ByteArray(0)): ByteArray {
@@ -544,6 +697,7 @@ class S3Watch : SGCManager() {
         val localGatt = gatt ?: return
         if (writeInFlight) return
         val op = writeQueue.poll() ?: return
+        currentOp = op
         val characteristic =
             when (op.uuid) {
                 S3WatchProtocol.CTRL_UUID -> ctrlChar
@@ -570,74 +724,210 @@ class S3Watch : SGCManager() {
         return current
     }
 
-    private fun decodeToJpeg(base64ImageData: String): ByteArray? {
+    private fun decodeToJpeg(
+        base64ImageData: String,
+        x: Int? = null,
+        y: Int? = null,
+        width: Int? = null,
+        height: Int? = null,
+    ): ByteArray? {
         return try {
             val raw = Base64.decode(base64ImageData, Base64.DEFAULT)
-            if (raw.size >= 2 && raw[0] == 0xFF.toByte() && raw[1] == 0xD8.toByte()) {
-                return raw
-            }
             val bitmap = BitmapFactory.decodeByteArray(raw, 0, raw.size) ?: return null
-            compressJpeg(bitmap)
+            val green = toHudGreen(bitmap)
+            val positioned = x != null || y != null || width != null || height != null
+            if (!positioned) {
+                return compressJpeg(green)
+            }
+            val canvasBmp =
+                Bitmap.createBitmap(
+                    S3WatchProtocol.DISPLAY_WIDTH,
+                    S3WatchProtocol.DISPLAY_HEIGHT,
+                    Bitmap.Config.ARGB_8888,
+                )
+            val canvas = Canvas(canvasBmp)
+            canvas.drawColor(Color.BLACK)
+            canvas.drawBitmap(
+                green,
+                null,
+                sceneRectOnPanel(
+                    x ?: 0,
+                    y ?: 0,
+                    width ?: green.width,
+                    height ?: green.height,
+                    usesG2Layout(x ?: 0, y ?: 0, width ?: green.width, height ?: green.height),
+                ),
+                null,
+            )
+            compressJpeg(canvasBmp)
         } catch (e: Exception) {
             Bridge.log("$TAG: decodeToJpeg failed: ${e.message}")
             null
         }
     }
 
+    private fun usesG2Layout(x: Int, y: Int, w: Int, h: Int): Boolean {
+        return x + w > S3WatchProtocol.SCENE_WIDTH || y + h > S3WatchProtocol.SCENE_HEIGHT
+    }
+
+    /** Native boxes map 1:1 into the safe area. G2 boxes are letterboxed from 576×288. */
+    private fun sceneRectOnPanel(x: Int, y: Int, w: Int, h: Int, g2: Boolean): Rect {
+        if (!g2) {
+            return Rect(
+                S3WatchProtocol.SCENE_ORIGIN_X + x,
+                S3WatchProtocol.SCENE_ORIGIN_Y + y,
+                S3WatchProtocol.SCENE_ORIGIN_X + x + w,
+                S3WatchProtocol.SCENE_ORIGIN_Y + y + h,
+            )
+        }
+        val scale =
+            minOf(
+                S3WatchProtocol.SCENE_WIDTH.toFloat() / S3WatchProtocol.G2_WIDTH,
+                S3WatchProtocol.SCENE_HEIGHT.toFloat() / S3WatchProtocol.G2_HEIGHT,
+            )
+        val sceneW = S3WatchProtocol.G2_WIDTH * scale
+        val sceneH = S3WatchProtocol.G2_HEIGHT * scale
+        val ox = S3WatchProtocol.SCENE_ORIGIN_X + (S3WatchProtocol.SCENE_WIDTH - sceneW) / 2f
+        val oy = S3WatchProtocol.SCENE_ORIGIN_Y + (S3WatchProtocol.SCENE_HEIGHT - sceneH) / 2f
+        return Rect(
+            (ox + x * scale).toInt(),
+            (oy + y * scale).toInt(),
+            (ox + (x + w) * scale).toInt(),
+            (oy + (y + h) * scale).toInt(),
+        )
+    }
+
     private fun rasterizeScene(frame: SceneFrame): ByteArray? {
-        val bitmap =
+        val g2 = frame.elements.any { usesG2Layout(it.x, it.y, it.w, it.h) }
+        val srcW = if (g2) S3WatchProtocol.G2_WIDTH else S3WatchProtocol.SCENE_WIDTH
+        val srcH = if (g2) S3WatchProtocol.G2_HEIGHT else S3WatchProtocol.SCENE_HEIGHT
+        val scene = Bitmap.createBitmap(srcW, srcH, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(scene)
+        canvas.drawColor(Color.BLACK)
+        val fill = Paint().apply { color = Color.WHITE }
+        for (el in frame.elements) {
+            if (el.type != "image") continue
+            val data = el.data ?: continue
+            val bytes =
+                try {
+                    Base64.decode(data, Base64.DEFAULT)
+                } catch (_: Exception) {
+                    continue
+                }
+            val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: continue
+            canvas.drawBitmap(decoded, null, Rect(el.x, el.y, el.x + el.w, el.y + el.h), fill)
+        }
+        val panel =
             Bitmap.createBitmap(
                 S3WatchProtocol.DISPLAY_WIDTH,
                 S3WatchProtocol.DISPLAY_HEIGHT,
                 Bitmap.Config.ARGB_8888,
             )
-        val canvas = Canvas(bitmap)
-        canvas.drawColor(Color.BLACK)
-        val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+        val panelCanvas = Canvas(panel)
+        panelCanvas.drawColor(Color.BLACK)
+        val blit = Paint(Paint.FILTER_BITMAP_FLAG)
+        panelCanvas.drawBitmap(toHudGreen(scene), null, sceneRectOnPanel(0, 0, srcW, srcH, g2), blit)
+        val hud = Color.rgb(S3WatchProtocol.HUD_GREEN_R, S3WatchProtocol.HUD_GREEN_G, S3WatchProtocol.HUD_GREEN_B)
+        val scale =
+            if (g2) {
+                minOf(
+                    S3WatchProtocol.SCENE_WIDTH.toFloat() / S3WatchProtocol.G2_WIDTH,
+                    S3WatchProtocol.SCENE_HEIGHT.toFloat() / S3WatchProtocol.G2_HEIGHT,
+                )
+            } else {
+                1f
+            }
         val stroke =
-            Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.WHITE
+            Paint().apply {
+                isAntiAlias = false
+                color = hud
                 style = Paint.Style.STROKE
             }
         val textPaint =
-            Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = Color.WHITE
-                textSize = 32f
+            TextPaint().apply {
+                isAntiAlias = false
+                color = hud
+                textSize = S3WatchProtocol.SCENE_TEXT_SIZE * scale
             }
-        val insetX = 16f
-        val insetY = 64f
+        val lineH = S3WatchProtocol.SCENE_LINE_HEIGHT * scale
         for (el in frame.elements) {
-            when (el.type) {
-                "rect" -> {
-                    stroke.strokeWidth = maxOf(1, el.border).toFloat()
-                    canvas.drawRoundRect(
-                        RectF(el.x.toFloat(), el.y.toFloat(), (el.x + el.w).toFloat(), (el.y + el.h).toFloat()),
-                        el.radius.toFloat(),
-                        el.radius.toFloat(),
-                        stroke,
-                    )
-                }
-                "text" -> {
-                    val text = el.text.orEmpty()
-                    val fm = textPaint.fontMetrics
-                    val x = maxOf(el.x.toFloat(), insetX)
-                    val y = maxOf(el.y.toFloat(), insetY)
-                    canvas.drawText(text, x, y - fm.ascent, textPaint)
-                }
-                "image" -> {
-                    val data = el.data ?: continue
-                    val bytes =
-                        try {
-                            Base64.decode(data, Base64.DEFAULT)
-                        } catch (_: Exception) {
-                            continue
-                        }
-                    val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: continue
-                    canvas.drawBitmap(decoded, null, Rect(el.x, el.y, el.x + el.w, el.y + el.h), fill)
-                }
+            if (el.type != "text" && el.type != "rect") continue
+            val box = sceneRectOnPanel(el.x, el.y, el.w, el.h, g2)
+            val left = box.left.toFloat()
+            val top = box.top.toFloat()
+            val right = box.right.toFloat()
+            val bottom = box.bottom.toFloat()
+            if (el.type == "rect" || el.border > 0) {
+                panelCanvas.save()
+                panelCanvas.clipRect(box)
+                stroke.strokeWidth = maxOf(1, el.border).toFloat()
+                panelCanvas.drawRoundRect(RectF(left, top, right, bottom), el.radius.toFloat(), el.radius.toFloat(), stroke)
+                panelCanvas.restore()
+            }
+            if (el.type == "text") {
+                drawWrappedText(panelCanvas, el.text.orEmpty(), box, textPaint, lineH)
             }
         }
-        return compressJpeg(bitmap)
+        return compressJpeg(panel)
+    }
+
+    /**
+     * Engine wraps with G1/G2 glyph widths. This panel draws Android's
+     * default font, which is wider, so those newlines overflow the box.
+     * Re-wrap with the same paint we draw so words break at the box edge.
+     */
+    private fun drawWrappedText(
+        canvas: Canvas,
+        text: String,
+        box: Rect,
+        paint: TextPaint,
+        lineH: Float,
+    ) {
+        if (text.isEmpty() || box.width() <= 0 || box.height() <= 0) return
+        val fm = paint.fontMetrics
+        val extra = (lineH - (fm.descent - fm.ascent)).coerceAtLeast(0f)
+        val layout =
+            StaticLayout.Builder
+                .obtain(text, 0, text.length, paint, box.width())
+                .setAlignment(Layout.Alignment.ALIGN_NORMAL)
+                .setLineSpacing(extra, 1f)
+                .setIncludePad(false)
+                .build()
+        canvas.save()
+        canvas.clipRect(box)
+        canvas.translate(box.left.toFloat(), box.top.toFloat())
+        layout.draw(canvas)
+        canvas.restore()
+    }
+
+    /**
+     * Green-on-black with G2-style 16 intensity levels. The watch remaps
+     * luma onto the current HUD hue (BOOT-hold color cycle).
+     */
+    private fun toHudGreen(src: Bitmap): Bitmap {
+        val w = src.width
+        val h = src.height
+        val out = src.copy(Bitmap.Config.ARGB_8888, true) ?: Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val px = IntArray(w * h)
+        out.getPixels(px, 0, w, 0, 0, w, h)
+        val levels = S3WatchProtocol.HUD_INTENSITY_LEVELS.coerceAtLeast(2)
+        val last = (levels - 1).toFloat()
+        val hr = S3WatchProtocol.HUD_GREEN_R
+        val hg = S3WatchProtocol.HUD_GREEN_G
+        val hb = S3WatchProtocol.HUD_GREEN_B
+        for (i in px.indices) {
+            val c = px[i]
+            val lum = Color.red(c) * 0.299f + Color.green(c) * 0.587f + Color.blue(c) * 0.114f
+            val q = ((lum.coerceIn(0f, 255f) / 255f) * last + 0.5f).toInt().coerceIn(0, levels - 1)
+            if (q == 0) {
+                px[i] = Color.BLACK
+            } else {
+                val t = q / last
+                px[i] = Color.rgb((hr * t).toInt(), (hg * t).toInt(), (hb * t).toInt())
+            }
+        }
+        out.setPixels(px, 0, w, 0, 0, w, h)
+        return out
     }
 
     private fun compressJpeg(bitmap: Bitmap): ByteArray {
@@ -689,6 +979,11 @@ class S3Watch : SGCManager() {
         writeQueue.clear()
         notifyQueue.clear()
         writeInFlight = false
+        currentOp = null
+        pendingJpeg = null
+        jpegTransferActive = false
+        pendingControls.clear()
+        handler.removeCallbacks(jpegAckTimeout)
         notifyWriteInFlight = false
         ctrlChar = null
         evtChar = null
@@ -706,5 +1001,10 @@ class S3Watch : SGCManager() {
         }
     }
 
-    private data class WriteOp(val uuid: UUID, val payload: ByteArray, val noResponse: Boolean)
+    private data class WriteOp(
+        val uuid: UUID,
+        val payload: ByteArray,
+        val noResponse: Boolean,
+        val endsJpeg: Boolean = false,
+    )
 }

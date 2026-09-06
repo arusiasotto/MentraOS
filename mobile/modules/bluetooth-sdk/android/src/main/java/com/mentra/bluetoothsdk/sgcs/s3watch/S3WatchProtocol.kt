@@ -25,7 +25,9 @@ object S3WatchProtocol {
     const val CMD_CLEAR: Byte = 0x02
     const val CMD_BRIGHTNESS: Byte = 0x03
     const val CMD_MIC_ENABLE: Byte = 0x04
+    // Payload: unix seconds u32le, timezone offset minutes i16le (includes DST).
     const val CMD_TIME_SYNC: Byte = 0x05
+    const val CMD_MENU: Byte = 0x06
     const val CMD_IMG_BEGIN: Byte = 0x10
     const val CMD_IMG_END: Byte = 0x12
 
@@ -33,6 +35,27 @@ object S3WatchProtocol {
     const val EVT_BATTERY: Byte = 0x81.toByte()
     const val EVT_READY: Byte = 0x82.toByte()
     const val EVT_GESTURE: Byte = 0x83.toByte()
+    const val EVT_MENU_SELECT: Byte = 0x84.toByte()
+
+    const val MENU_MAX_ITEMS = 10
+    const val MENU_NAME_MAX = 15
+
+    data class MenuEntry(val running: Boolean, val name: String)
+
+    fun encodeMenu(items: List<MenuEntry>): ByteArray {
+        val capped = items.take(MENU_MAX_ITEMS)
+        val out = java.io.ByteArrayOutputStream()
+        out.write(capped.size)
+        for (item in capped) {
+            val name = item.name.trim().take(MENU_NAME_MAX).toByteArray(Charsets.UTF_8)
+            out.write(if (item.running) 1 else 0)
+            out.write(name.size)
+            if (name.isNotEmpty()) {
+                out.write(name)
+            }
+        }
+        return out.toByteArray()
+    }
 
     const val GESTURE_SWIPE_UP: Byte = 0x01
     const val GESTURE_SWIPE_DOWN: Byte = 0x02
@@ -42,7 +65,22 @@ object S3WatchProtocol {
 
     const val DISPLAY_WIDTH = 410
     const val DISPLAY_HEIGHT = 502
-    const val JPEG_QUALITY = 70
+    // Public scene canvas = AMOLED safe area. G2 frames use 576×288.
+    const val SCENE_WIDTH = 378
+    const val SCENE_HEIGHT = 414
+    const val G2_WIDTH = 576
+    const val G2_HEIGHT = 288
+    const val SCENE_ORIGIN_X = 16
+    const val SCENE_ORIGIN_Y = 64
+    const val SCENE_LINE_HEIGHT = 40
+    const val SCENE_TEXT_SIZE = 28f
+    const val JPEG_QUALITY = 85
+    // Mentra HUD green (#00FF88) — same tint as GlassesDisplayMirror.
+    const val HUD_GREEN_R = 0
+    const val HUD_GREEN_G = 255
+    const val HUD_GREEN_B = 136
+    // G2 image path is 4-bit (16 greens). Quantize to that, do not 1-bit dither.
+    const val HUD_INTENSITY_LEVELS = 16
     const val REQUESTED_MTU = 512
 
     const val MIC_SAMPLE_RATE = 16000

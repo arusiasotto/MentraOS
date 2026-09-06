@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>Watch Gestures</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+        color: #dfffea;
+        background: #06110c;
+      }
+      main {
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        padding: 28px;
+      }
+      .card {
+        width: min(100%, 420px);
+        border: 1px solid #1c4a36;
+        border-radius: 24px;
+        background: #0b1c14;
+        padding: 28px;
+        text-align: center;
+      }
+      h1 {
+        margin: 0 0 8px;
+        font-size: 22px;
+      }
+      p {
+        margin: 0;
+        color: #7ea894;
+        font-size: 15px;
+        line-height: 1.4;
+      }
+      .kind {
+        margin: 28px 0 12px;
+        min-height: 64px;
+        display: grid;
+        place-items: center;
+        border-radius: 16px;
+        background: #10261b;
+        color: #00ff88;
+        font-size: 32px;
+        font-weight: 800;
+      }
+      .count {
+        color: #7ea894;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 14px;
+      }
+      .version {
+        margin-top: 22px;
+        color: #4d6b5d;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="card">
+        <h1>Watch Gestures</h1>
+        <p>Swipe or tap the watch. The last gesture shows here and on the wearable.</p>
+        <div class="kind" id="kind">waiting…</div>
+        <div class="count" id="count">#0</div>
+        <div class="version">com.mentra.watchgestures · v__WATCH_GESTURES_VERSION__</div>
+      </section>
+    </main>
+    <script>
+      const kindEl = document.getElementById("kind")
+      const countEl = document.getElementById("count")
+      const labels = {
+        swipe_up: "swipe up",
+        swipe_down: "swipe down",
+        single_tap: "tap",
+        double_tap: "double tap",
+        long_press: "hold",
+        "waiting…": "waiting…",
+      }
+      window.mentra?.on?.("gestures:last", ({kind, count}) => {
+        kindEl.textContent = labels[kind] || kind
+        countEl.textContent = "#" + count
+      })
+      window.mentra?.ready?.()
+    </script>
+  </body>
+</html>

@@ -12,8 +12,18 @@
 #include <esp_mac.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
+#include <math.h>
+#include <string.h>
+#include <sys/time.h>
+#include <time.h>
 #include <Arduino_GFX_Library.h>
 #include <JPEGDEC.h>
+#include <driver/gpio.h>
+#include <driver/usb_serial_jtag.h>
+#include <esp_pm.h>
+#include <esp_sleep.h>
+#include <soc/soc.h>
+#include <soc/usb_serial_jtag_reg.h>
 #include "settings.h"
 
 #ifndef RGB565_BLACK
@@ -41,10 +51,13 @@ static uint8_t txSeq = 1;
 static uint8_t brightness = 80;
 static volatile bool micEnabled = false;
 static volatile bool micFlushPending = false;
-static uint32_t micFramesSent = 0;
-static volatile uint32_t micDrops = 0;
-static uint32_t micLastLogMs = 0;
+static volatile bool audioReady = false;
+static volatile bool audioStartPending = false;
+static volatile bool audioStopPending = false;
+static bool usbPadOff = false;
 static QueueHandle_t micQueue = nullptr;
+static bool ensureAudio();
+static void releaseAudio();
 
 constexpr size_t MIC_NOTIFY_SAMPLES = 160;
 struct MicFrame {
@@ -55,6 +68,50 @@ static uint8_t *jpegBuf = nullptr;
 static size_t jpegCap = 0;
 static size_t jpegLen = 0;
 static size_t jpegExpected = 0;
+static volatile bool jpegBlitPending = false;
+static volatile bool jpegBusy = false;
+static bool jpegReceiving = false;
+static uint8_t jpegEndSeq = 0;
+static bool hudFromJpeg = false;
+static bool idleFace = true;
+static uint32_t lastJpegMs = 0;
+static bool clockSynced = false;
+static int16_t tzOffsetMin = 0;
+static bool faceDialDrawn = false;
+static int lastShownSec = -1;
+static uint8_t batteryPercent = 0;
+static uint8_t lastShownBattery = 255;
+static int16_t lastSecX = 0;
+static int16_t lastSecY = 0;
+static char pendingText[513];
+static volatile bool textPending = false;
+static volatile bool brightnessPending = false;
+static uint8_t pendingBrightness = 80;
+static bool displayAsleep = false;
+static volatile bool wakePending = false;
+static uint32_t lastActivityMs = 0;
+static bool touchSwallow = false;
+static bool pwrWasDown = false;
+static bool bootWasDown = false;
+static uint32_t pwrDownMs = 0;
+static bool pwrHoldSleep = false;
+static uint32_t bootDownMs = 0;
+static bool bootHoldColor = false;
+static uint8_t hudColorIndex = 0;
+static size_t lastBlitLen = 0;
+
+struct MenuItem {
+  bool running;
+  char name[MENU_NAME_MAX + 1];
+};
+static MenuItem menuItems[MENU_MAX_ITEMS];
+static uint8_t menuCount = 0;
+static uint8_t menuIndex = 0;
+static bool menuOpen = false;
+static volatile bool menuPending = false;
+static esp_pm_lock_handle_t stayAwakeLock = nullptr;
+static bool stayAwakeHeld = false;
+static bool pmReady = false;
 
 static char deviceName[24];
 
@@ -78,9 +135,36 @@ static bool sendEvent(uint8_t opcode, const uint8_t *payload, uint16_t len) {
   return true;
 }
 
+static void ft3168Write(uint8_t reg, uint8_t value);
+
 static void sendAck(uint8_t cmd, uint8_t seq, uint8_t status) {
   const uint8_t payload[3] = {cmd, seq, status};
   sendEvent(EVT_ACK, payload, 3);
+}
+
+static uint16_t hudColor() {
+  return HUD_PALETTE[hudColorIndex < HUD_PALETTE_COUNT ? hudColorIndex : 0];
+}
+
+static void recolorRgb565(uint16_t *px, int n) {
+  const uint16_t dst = hudColor();
+  if (dst == DISPLAY_HUD_GREEN) return;
+  const uint8_t dr = (uint8_t)((dst >> 11) & 0x1F);
+  const uint8_t dg = (uint8_t)((dst >> 5) & 0x3F);
+  const uint8_t db = (uint8_t)(dst & 0x1F);
+  for (int i = 0; i < n; i++) {
+    const uint16_t p = px[i];
+    if (p == 0) continue;
+    const uint16_t r = (uint16_t)((p >> 11) & 0x1F) * 8;
+    const uint16_t g = (uint16_t)((p >> 5) & 0x3F) * 4;
+    const uint16_t b = (uint16_t)(p & 0x1F) * 8;
+    const uint16_t lum = (uint16_t)((r * 30 + g * 59 + b * 11) / 100);
+    if (lum < 8) {
+      px[i] = 0;
+      continue;
+    }
+    px[i] = (uint16_t)(((dr * lum / 255) << 11) | ((dg * lum / 255) << 5) | (db * lum / 255));
+  }
 }
 
 static void sanitizeAscii(const char *in, char *out, size_t outCap) {
@@ -147,7 +231,7 @@ static void drawTextWall(const char *text) {
   sanitizeAscii(text, buf, sizeof(buf));
   gfx->fillScreen(RGB565_BLACK);
   gfx->fillRect(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT, RGB565_BLACK);
-  gfx->setTextColor(RGB565_WHITE);
+  gfx->setTextColor(hudColor());
   gfx->setTextSize(2);
   int x = DISPLAY_TEXT_ORIGIN_X;
   int y = DISPLAY_TEXT_ORIGIN_Y;
@@ -176,23 +260,285 @@ static void drawTextWall(const char *text) {
   }
 }
 
-static void drawIdle(const char *status) {
-  char line[80];
-  snprintf(line, sizeof(line), "MentraOS\nS3 Watch\n%s", status ? status : "Waiting...");
-  drawTextWall(line);
+static bool localNow(struct tm *out) {
+  time_t utc = time(nullptr);
+  if (!clockSynced || utc < 1700000000) return false;
+  const time_t local = utc + (time_t)tzOffsetMin * 60;
+  gmtime_r(&local, out);
+  return true;
 }
 
+static void applyTimeSync(const uint8_t *payload, uint16_t n) {
+  if (n < 4) return;
+  const uint32_t sec = (uint32_t)payload[0] | ((uint32_t)payload[1] << 8) | ((uint32_t)payload[2] << 16) |
+                       ((uint32_t)payload[3] << 24);
+  if (n >= 6) {
+    tzOffsetMin = (int16_t)((uint16_t)payload[4] | ((uint16_t)payload[5] << 8));
+  } else if (tzOffsetMin == 0) {
+    tzOffsetMin = -240;
+  }
+  struct timeval tv;
+  tv.tv_sec = (time_t)sec;
+  tv.tv_usec = 0;
+  settimeofday(&tv, nullptr);
+  clockSynced = true;
+  lastShownSec = -1;
+}
+
+static void textBounds(const char *text, uint8_t size, uint16_t *w, uint16_t *h) {
+  gfx->setTextSize(size);
+  int16_t x1 = 0;
+  int16_t y1 = 0;
+  gfx->getTextBounds(text, 0, 0, &x1, &y1, w, h);
+}
+
+static void drawCentered(const char *text, int16_t y, uint8_t size, uint16_t color) {
+  uint16_t w = 0;
+  uint16_t h = 0;
+  textBounds(text, size, &w, &h);
+  gfx->setTextColor(color);
+  const int16_t x = (int16_t)((DISPLAY_WIDTH - (int)w) / 2);
+  gfx->setCursor(x, y);
+  gfx->print(text);
+}
+
+static void drawTimeWithAmPm(const char *timeText, const char *ampm, int16_t y) {
+  uint16_t timeW = 0;
+  uint16_t timeH = 0;
+  uint16_t ampmW = 0;
+  uint16_t ampmH = 0;
+  textBounds(timeText, 6, &timeW, &timeH);
+  if (ampm && ampm[0]) {
+    textBounds(ampm, 2, &ampmW, &ampmH);
+  }
+  const int16_t gap = ampmW ? 10 : 0;
+  const int16_t total = (int16_t)(timeW + gap + ampmW);
+  const int16_t x0 = (int16_t)((DISPLAY_WIDTH - total) / 2);
+  gfx->setTextColor(hudColor());
+  gfx->setTextSize(6);
+  gfx->setCursor(x0, y);
+  gfx->print(timeText);
+  if (ampmW) {
+    gfx->setTextSize(2);
+    gfx->setCursor((int16_t)(x0 + timeW + gap), (int16_t)(y + 8));
+    gfx->print(ampm);
+  }
+}
+
+static void drawWatchDial() {
+  const int16_t cx = DISPLAY_WIDTH / 2;
+  const int16_t cy = DISPLAY_HEIGHT / 2;
+  const int16_t r = 168;
+  gfx->fillScreen(RGB565_BLACK);
+  yield();
+  gfx->drawCircle(cx, cy, r, hudColor());
+  gfx->drawCircle(cx, cy, r - 1, hudColor());
+  for (int i = 0; i < 12; i++) {
+    const float a = (float)i * 30.0f * DEG_TO_RAD - (float)M_PI / 2.0f;
+    const int16_t x0 = (int16_t)(cx + (int)((r - 14) * cosf(a)));
+    const int16_t y0 = (int16_t)(cy + (int)((r - 14) * sinf(a)));
+    const int16_t x1 = (int16_t)(cx + (int)((r - 2) * cosf(a)));
+    const int16_t y1 = (int16_t)(cy + (int)((r - 2) * sinf(a)));
+    gfx->drawLine(x0, y0, x1, y1, hudColor());
+  }
+  faceDialDrawn = true;
+}
+
+static void drawWatchFace(bool force) {
+  if (!idleFace || hudFromJpeg || jpegBusy || jpegReceiving || jpegBlitPending) return;
+
+  struct tm t;
+  const bool synced = localNow(&t);
+  if (!force) {
+    if (synced && t.tm_sec == lastShownSec && batteryPercent == lastShownBattery) return;
+    if (!synced && lastShownSec == -2 && batteryPercent == lastShownBattery) return;
+  }
+  const uint8_t prevBattery = lastShownBattery;
+  lastShownSec = synced ? t.tm_sec : -2;
+  lastShownBattery = batteryPercent;
+
+  const int16_t cx = DISPLAY_WIDTH / 2;
+  const int16_t cy = DISPLAY_HEIGHT / 2;
+  const int16_t r = 168;
+
+  const bool redrewDial = !faceDialDrawn || force;
+  if (redrewDial) {
+    drawWatchDial();
+    lastSecX = 0;
+    lastSecY = 0;
+  }
+
+  if (lastSecX != 0 || lastSecY != 0) {
+    gfx->fillCircle(lastSecX, lastSecY, 5, RGB565_BLACK);
+  }
+
+  char timeBuf[8];
+  char dateBuf[20];
+  char ampmBuf[4];
+  char battBuf[8];
+  snprintf(battBuf, sizeof(battBuf), "%u%%", (unsigned)batteryPercent);
+  if (synced) {
+    int hour = t.tm_hour % 12;
+    if (hour == 0) hour = 12;
+    snprintf(timeBuf, sizeof(timeBuf), "%d:%02d", hour, t.tm_min);
+    strftime(dateBuf, sizeof(dateBuf), "%a %b %d", &t);
+    snprintf(ampmBuf, sizeof(ampmBuf), "%s", t.tm_hour >= 12 ? "PM" : "AM");
+    const float a = (float)t.tm_sec * 6.0f * DEG_TO_RAD - (float)M_PI / 2.0f;
+    lastSecX = (int16_t)(cx + (int)((r - 18) * cosf(a)));
+    lastSecY = (int16_t)(cy + (int)((r - 18) * sinf(a)));
+    gfx->fillCircle(lastSecX, lastSecY, 5, hudColor());
+  } else {
+    snprintf(timeBuf, sizeof(timeBuf), "--:--");
+    dateBuf[0] = 0;
+    ampmBuf[0] = 0;
+    lastSecX = 0;
+    lastSecY = 0;
+  }
+
+  const int16_t boxX = (int16_t)(cx - 130);
+  const int16_t boxY = (int16_t)(cy - 46);
+  gfx->fillRect(boxX, boxY, 260, 92, RGB565_BLACK);
+  drawTimeWithAmPm(timeBuf, ampmBuf, (int16_t)(cy - 38));
+  if (dateBuf[0]) {
+    drawCentered(dateBuf, (int16_t)(cy + 22), 2, hudColor());
+  }
+  if (redrewDial || prevBattery != batteryPercent) {
+    const int16_t battY = (int16_t)(cy + r - 36);
+    gfx->fillRect((int16_t)(cx - 40), (int16_t)(battY - 4), 80, 24, RGB565_BLACK);
+    drawCentered(battBuf, battY, 2, hudColor());
+  }
+}
+
+// BLE callbacks must not paint. QSPI from NimBLE's task watchdog-resets
+// the chip (connect looked like a bootloop).
+static void requestIdleFace() {
+  idleFace = true;
+  hudFromJpeg = false;
+  if (!faceDialDrawn) {
+    lastShownSec = -1;
+  }
+}
+
+static void applyMenu(const uint8_t *payload, uint16_t n) {
+  menuCount = 0;
+  if (n < 1) {
+    if (menuOpen) menuPending = true;
+    return;
+  }
+  uint8_t count = payload[0];
+  if (count > MENU_MAX_ITEMS) count = MENU_MAX_ITEMS;
+  size_t i = 1;
+  for (uint8_t k = 0; k < count && i + 2 <= n; k++) {
+    const uint8_t running = payload[i++];
+    const uint8_t len = payload[i++];
+    if (i + len > n) break;
+    const uint8_t copy = len < MENU_NAME_MAX ? len : MENU_NAME_MAX;
+    memcpy(menuItems[menuCount].name, payload + i, copy);
+    menuItems[menuCount].name[copy] = 0;
+    menuItems[menuCount].running = running != 0;
+    i += len;
+    menuCount++;
+  }
+  if (menuIndex >= menuCount) menuIndex = 0;
+  if (menuOpen) menuPending = true;
+}
+
+static void drawMenu() {
+  gfx->fillScreen(RGB565_BLACK);
+  drawCentered("APPS", 52, 3, hudColor());
+  if (menuCount == 0) {
+    drawCentered("No apps yet", 200, 2, hudColor());
+    drawCentered("Mentra > Glasses menu", 240, 2, hudColor());
+    return;
+  }
+  constexpr uint8_t visible = 7;
+  constexpr int16_t rowH = 40;
+  constexpr int16_t y0 = 108;
+  uint8_t start = 0;
+  if (menuCount > visible) {
+    if (menuIndex >= visible / 2) {
+      start = (uint8_t)(menuIndex - visible / 2);
+    }
+    if ((uint8_t)(start + visible) > menuCount) {
+      start = (uint8_t)(menuCount - visible);
+    }
+  }
+  const uint8_t end = (uint8_t)(start + visible < menuCount ? start + visible : menuCount);
+  for (uint8_t i = start; i < end; i++) {
+    const int16_t y = (int16_t)(y0 + (int16_t)(i - start) * rowH);
+    char line[20];
+    snprintf(line, sizeof(line), "%s%s", menuItems[i].running ? "* " : "  ", menuItems[i].name);
+    if (i == menuIndex) {
+      gfx->fillRect(24, y - 6, DISPLAY_WIDTH - 48, rowH - 6, hudColor());
+      gfx->setTextColor(RGB565_BLACK);
+    } else {
+      gfx->setTextColor(hudColor());
+    }
+    gfx->setTextSize(2);
+    gfx->setCursor(40, y);
+    gfx->print(line);
+  }
+}
+
+static void closeMenu() {
+  menuOpen = false;
+  menuPending = false;
+  requestIdleFace();
+  lastShownSec = -1;
+}
+
+static void openMenu() {
+  menuOpen = true;
+  menuPending = true;
+  textPending = false;
+  noteActivity();
+}
+
+static void handleMenuGesture(uint8_t id) {
+  if (id == GESTURE_SWIPE_UP) {
+    if (menuCount) {
+      menuIndex = (uint8_t)((menuIndex + menuCount - 1) % menuCount);
+      menuPending = true;
+    }
+  } else if (id == GESTURE_SWIPE_DOWN) {
+    if (menuCount) {
+      menuIndex = (uint8_t)((menuIndex + 1) % menuCount);
+      menuPending = true;
+    }
+  } else if (id == GESTURE_SINGLE_TAP || id == GESTURE_DOUBLE_TAP) {
+    if (menuCount) {
+      sendEvent(EVT_MENU_SELECT, &menuIndex, 1);
+    }
+    closeMenu();
+    drawWatchFace(true);
+  } else if (id == GESTURE_LONG_PRESS) {
+    closeMenu();
+    drawWatchFace(true);
+  }
+}
+
+static void pumpMic();
+
 static int jpegDraw(JPEGDRAW *pDraw) {
+  recolorRgb565(pDraw->pPixels, pDraw->iWidth * pDraw->iHeight);
   gfx->draw16bitRGBBitmap(pDraw->x, pDraw->y, pDraw->pPixels, pDraw->iWidth, pDraw->iHeight);
+  // Captions can blit for hundreds of ms. Keep mic notifies moving or the
+  // queue overflows and STT looks like the glasses mic never started.
+  pumpMic();
   return 1;
 }
 
 static void blitJpeg() {
-  if (jpegBuf == nullptr || jpegLen < 4) return;
+  if (jpegBuf == nullptr || jpegLen < 4) {
+    Serial.printf("jpeg blit skip len=%u\n", (unsigned)jpegLen);
+    return;
+  }
+  lastBlitLen = jpegLen;
   if (jpeg.openRAM(jpegBuf, (int)jpegLen, jpegDraw) == 1) {
     jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
     jpeg.decode(0, 0, 0);
     jpeg.close();
+    Serial.printf("jpeg blit ok %u\n", (unsigned)jpegLen);
   } else {
     Serial.println("jpeg open failed");
   }
@@ -201,7 +547,102 @@ static void blitJpeg() {
 static void applyBrightness(uint8_t level) {
   brightness = level;
   if (brightness > 100) brightness = 100;
+  if (!displayAsleep) {
+    gfx->setBrightness((uint8_t)((brightness * 255) / 100));
+  }
+}
+
+static void noteActivity() {
+  lastActivityMs = millis();
+}
+
+static bool displayBusy() {
+  return jpegReceiving || jpegBusy || jpegBlitPending || textPending;
+}
+
+static bool shouldStayAwake() {
+  return displayBusy() || menuOpen;
+}
+
+static void holdAwake() {
+  if (!pmReady || stayAwakeHeld || stayAwakeLock == nullptr) return;
+  esp_pm_lock_acquire(stayAwakeLock);
+  stayAwakeHeld = true;
+}
+
+static void releaseAwake() {
+  if (!pmReady || !stayAwakeHeld || stayAwakeLock == nullptr) return;
+  esp_pm_lock_release(stayAwakeLock);
+  stayAwakeHeld = false;
+}
+
+static void updateSleepLocks() {
+  if (!displayAsleep || shouldStayAwake()) {
+    holdAwake();
+  } else {
+    releaseAwake();
+  }
+}
+
+static void setupPowerMgmt() {
+  gpio_wakeup_enable((gpio_num_t)PIN_PWR_SENSE, GPIO_INTR_HIGH_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)PIN_BOOT, GPIO_INTR_LOW_LEVEL);
+  gpio_wakeup_enable((gpio_num_t)PIN_TP_INT, GPIO_INTR_LOW_LEVEL);
+  esp_sleep_enable_gpio_wakeup();
+
+  if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "hud", &stayAwakeLock) != ESP_OK) {
+    Serial.println("pm lock create failed");
+    return;
+  }
+  esp_pm_config_t cfg = {
+      .max_freq_mhz = 240,
+      .min_freq_mhz = 80,
+      .light_sleep_enable = true,
+  };
+  const esp_err_t err = esp_pm_configure(&cfg);
+  if (err != ESP_OK) {
+    Serial.printf("pm light-sleep failed: %s\n", esp_err_to_name(err));
+    return;
+  }
+  pmReady = true;
+  holdAwake();
+}
+
+static void sleepDisplay() {
+  if (displayAsleep || shouldStayAwake()) return;
+  gfx->setBrightness(0);
+  gfx->displayOff();
+  releaseAudio();
+  setUsbJtagPad(false);
+  displayAsleep = true;
+  // Interrupt on touch so a tap can wake without polling every loop.
+  ft3168Write(0xA4, 0x01);
+  updateSleepLocks();
+}
+
+static void wakeDisplay() {
+  const bool wasAsleep = displayAsleep;
+  displayAsleep = false;
+  wakePending = false;
+  holdAwake();
+  setUsbJtagPad(true);
+  ft3168Write(0xA4, 0x00);
+  gfx->displayOn();
   gfx->setBrightness((uint8_t)((brightness * 255) / 100));
+  noteActivity();
+  if (wasAsleep && micEnabled) {
+    audioStopPending = false;
+    audioStartPending = true;
+    micFlushPending = true;
+  }
+  if (wasAsleep && idleFace && !hudFromJpeg && !displayBusy()) {
+    drawWatchFace(true);
+  }
+}
+
+static void requestWake() {
+  wakePending = true;
+  lastActivityMs = millis();
 }
 
 static void handleControl(const uint8_t *data, size_t len) {
@@ -212,45 +653,75 @@ static void handleControl(const uint8_t *data, size_t len) {
   const uint8_t *payload = data + HDR_LEN;
   const size_t available = len > HDR_LEN ? len - HDR_LEN : 0;
   const uint16_t n = payloadLen < available ? payloadLen : (uint16_t)available;
-  Serial.printf("ctrl op=0x%02X n=%u\n", opcode, (unsigned)n);
 
+  Serial.printf("ctrl 0x%02X n=%u asleep=%u mic=%u\n", opcode, (unsigned)n,
+                displayAsleep ? 1 : 0, micEnabled ? 1 : 0);
   switch (opcode) {
     case CMD_TEXT: {
-      char text[513];
+      // Host still sends "// MentraOS Connected" on pair. The watch face
+      // is the idle UI now — do not cover it with a text wall.
+      if (n >= 11 && memcmp(payload, "// MentraOS", 11) == 0) {
+        sendAck(opcode, seq, 0);
+        break;
+      }
       const uint16_t copy = n < 512 ? n : 512;
-      memcpy(text, payload, copy);
-      text[copy] = 0;
-      drawTextWall(text);
+      memcpy(pendingText, payload, copy);
+      pendingText[copy] = 0;
+      idleFace = false;
+      hudFromJpeg = false;
+      faceDialDrawn = false;
+      textPending = true;
+      requestWake();
       sendAck(opcode, seq, 0);
       break;
     }
     case CMD_CLEAR:
-      // App start/stop sends clear. Do not paint the idle home screen here —
-      // that made Captions look like it bounced back to boot.
-      if (micEnabled) {
-        drawTextWall("Listening...");
-      } else {
-        gfx->fillScreen(RGB565_BLACK);
+      // Miniapp start/stop. Return to the watch face from loop(); a JPEG
+      // HUD will replace it if Captions (etc) is still drawing.
+      jpegReceiving = false;
+      jpegLen = 0;
+      textPending = false;
+      if (!menuOpen) {
+        requestIdleFace();
       }
       sendAck(opcode, seq, 0);
       break;
     case CMD_BRIGHTNESS:
-      if (n >= 1) applyBrightness(payload[0]);
+      if (n >= 1) {
+        pendingBrightness = payload[0];
+        brightnessPending = true;
+      }
       sendAck(opcode, seq, 0);
       break;
     case CMD_MIC_ENABLE:
       micEnabled = n >= 1 && payload[0] != 0;
-      Serial.printf("mic %s\n", micEnabled ? "on" : "off");
       if (micEnabled) {
-        micFlushPending = true;
-        drawTextWall("Listening...");
+        audioStopPending = false;
+        if (!displayAsleep) {
+          audioStartPending = true;
+          micFlushPending = true;
+        }
+      } else {
+        audioStartPending = false;
+        audioStopPending = true;
       }
+      updateSleepLocks();
       sendAck(opcode, seq, 0);
       break;
     case CMD_TIME_SYNC:
+      applyTimeSync(payload, n);
+      sendAck(opcode, seq, 0);
+      break;
+    case CMD_MENU:
+      applyMenu(payload, n);
       sendAck(opcode, seq, 0);
       break;
     case CMD_IMG_BEGIN: {
+      if (jpegBlitPending || jpegBusy || jpegReceiving) {
+        sendAck(opcode, seq, 1);
+        break;
+      }
+      jpegReceiving = true;
       jpegExpected = 0;
       jpegLen = 0;
       if (n >= 4) {
@@ -264,14 +735,21 @@ static void handleControl(const uint8_t *data, size_t len) {
         if (jpegBuf == nullptr) jpegBuf = (uint8_t *)malloc(jpegExpected ? jpegExpected : 1);
         jpegCap = jpegBuf ? jpegExpected : 0;
       }
+      requestWake();
+      Serial.printf("jpeg begin exp=%u buf=%u\n", (unsigned)jpegExpected, jpegBuf ? 1 : 0);
       sendAck(opcode, seq, jpegBuf || jpegExpected == 0 ? 0 : 1);
       break;
     }
     case CMD_IMG_END:
-      blitJpeg();
-      jpegLen = 0;
-      jpegExpected = 0;
-      sendAck(opcode, seq, 0);
+      Serial.printf("jpeg end recv=%u len=%u\n", jpegReceiving ? 1 : 0, (unsigned)jpegLen);
+      if (!jpegReceiving) {
+        sendAck(opcode, seq, 0);
+        break;
+      }
+      jpegReceiving = false;
+      jpegEndSeq = seq;
+      jpegBlitPending = true;
+      requestWake();
       break;
     default:
       sendAck(opcode, seq, 2);
@@ -291,7 +769,7 @@ class ImgCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
     uint8_t *data = characteristic->getData();
     size_t len = characteristic->getLength();
-    if (data == nullptr || len == 0 || jpegBuf == nullptr) return;
+    if (!jpegReceiving || data == nullptr || len == 0 || jpegBuf == nullptr) return;
     const size_t room = jpegCap > jpegLen ? jpegCap - jpegLen : 0;
     const size_t n = len < room ? len : room;
     if (n) {
@@ -306,13 +784,17 @@ class ServerCallbacks : public BLEServerCallbacks {
     deviceConnected = true;
     Serial.println("phone connected");
     sendEvent(EVT_READY, nullptr, 0);
-    const uint8_t battery = 100;
-    sendEvent(EVT_BATTERY, &battery, 1);
+    sendEvent(EVT_BATTERY, &batteryPercent, 1);
   }
-  void onDisconnect(BLEServer *server) override {
+  void   onDisconnect(BLEServer *server) override {
     deviceConnected = false;
     micEnabled = false;
+    audioStartPending = false;
+    audioStopPending = true;
     Serial.println("phone disconnected");
+    menuOpen = false;
+    menuPending = false;
+    requestIdleFace();
     server->startAdvertising();
   }
 };
@@ -403,6 +885,15 @@ static void es7210AnalogOn() {
   es7210Write(0x4C, 0x00);
 }
 
+static uint8_t readBatteryPercent() {
+  const uint8_t status = i2cReadReg(AXP2101_I2C_ADDR, AXP2101_STATUS1);
+  if (status == 0xFF) return 0;
+  // STATUS1 bit 3: battery present. USB-only boards report absent → 0%.
+  if ((status & 0x08) == 0) return 0;
+  const uint8_t pct = i2cReadReg(AXP2101_I2C_ADDR, AXP2101_BAT_PERCENT);
+  return pct > 100 ? 0 : pct;
+}
+
 // Waveshare #20: analog rails live on AXP2101 ALDO1–4.
 static void setupPmic() {
   const uint8_t id = i2cReadReg(AXP2101_I2C_ADDR, 0x03);
@@ -412,7 +903,31 @@ static void setupPmic() {
   }
   const uint8_t on = i2cReadReg(AXP2101_I2C_ADDR, 0x90);
   i2cWriteReg(AXP2101_I2C_ADDR, 0x90, (uint8_t)(on | 0x0F));
-  Serial.printf("axp2101 id=0x%02X ldo0=0x%02X\n", id, i2cReadReg(AXP2101_I2C_ADDR, 0x90));
+  const uint8_t det = i2cReadReg(AXP2101_I2C_ADDR, AXP2101_BAT_DET_CTRL);
+  if (det != 0xFF) {
+    i2cWriteReg(AXP2101_I2C_ADDR, AXP2101_BAT_DET_CTRL, (uint8_t)(det | 0x01));
+  }
+  const uint8_t gauge = i2cReadReg(AXP2101_I2C_ADDR, AXP2101_CHARGE_GAUGE_WDT);
+  if (gauge != 0xFF) {
+    i2cWriteReg(AXP2101_I2C_ADDR, AXP2101_CHARGE_GAUGE_WDT, (uint8_t)(gauge | 0x08));
+  }
+  batteryPercent = readBatteryPercent();
+}
+
+static void pumpBattery() {
+  static uint32_t lastMs = 0;
+  const uint32_t now = millis();
+  const uint32_t period = displayAsleep ? BATTERY_POLL_SLEEP_MS : BATTERY_POLL_MS;
+  if (lastMs != 0 && (uint32_t)(now - lastMs) < period) return;
+  lastMs = now;
+  const uint8_t pct = readBatteryPercent();
+  if (pct != batteryPercent) {
+    batteryPercent = pct;
+    lastShownSec = -1;
+  }
+  if (deviceConnected) {
+    sendEvent(EVT_BATTERY, &batteryPercent, 1);
+  }
 }
 
 // ES8311 shares MCLK/BCLK/LRCK with the ES7210. Bring it up as an I2S
@@ -449,17 +964,6 @@ static void es8311Init() {
   i2cWriteReg(ES8311_I2C_ADDR, 0x37, 0x08);
   i2cWriteReg(ES8311_I2C_ADDR, 0x31, 0x20);
   i2cWriteReg(ES8311_I2C_ADDR, 0x32, 0x00);
-  Serial.printf("es8311 id=0x%02X\n", i2cReadReg(ES8311_I2C_ADDR, 0xFD));
-}
-
-static void probeI2c() {
-  const uint8_t addrs[] = {0x18, 0x34, 0x38, 0x40, 0x51, 0x6B};
-  Serial.print("i2c:");
-  for (uint8_t addr : addrs) {
-    Wire.beginTransmission(addr);
-    if (Wire.endTransmission() == 0) Serial.printf(" 0x%02X", addr);
-  }
-  Serial.println();
 }
 
 static void recoverI2c() {
@@ -491,42 +995,14 @@ static void es7210Init() {
   delay(30);
   es7210Write(0x00, 0x41);
   delay(50);
-  Serial.printf(
-      "es7210 id=0x%02X%02X state=0x%02X clk=0x%02X analog 40=%02X 4B=%02X\n",
-      i2cReadReg(ES7210_I2C_ADDR, 0x3D),
-      i2cReadReg(ES7210_I2C_ADDR, 0x3E),
-      i2cReadReg(ES7210_I2C_ADDR, 0x00),
-      i2cReadReg(ES7210_I2C_ADDR, 0x16),
-      i2cReadReg(ES7210_I2C_ADDR, 0x40),
-      i2cReadReg(ES7210_I2C_ADDR, 0x4B));
 }
 
-static void logStereoLevels(const int16_t *stereo, size_t frames, const char *tag) {
-  int32_t left = 0;
-  int32_t right = 0;
-  int16_t lMin = 32767;
-  int16_t lMax = -32768;
-  int16_t rMin = 32767;
-  int16_t rMax = -32768;
-  for (size_t i = 0; i < frames; i++) {
-    const int16_t l = stereo[i * 2];
-    const int16_t r = stereo[i * 2 + 1];
-    left += l < 0 ? -l : l;
-    right += r < 0 ? -r : r;
-    if (l < lMin) lMin = l;
-    if (l > lMax) lMax = l;
-    if (r < rMin) rMin = r;
-    if (r > rMax) rMax = r;
-  }
-  if (frames == 0) frames = 1;
-  Serial.printf("%s n=%u L=%d [%d..%d] R=%d [%d..%d]\n", tag, (unsigned)frames,
-                (int)(left / (int32_t)frames), (int)lMin, (int)lMax,
-                (int)(right / (int32_t)frames), (int)rMin, (int)rMax);
-}
-
-static bool setupMic() {
-  setupPmic();
-  probeI2c();
+// I2S clocks block ESP32-S3 light sleep even when idle. Bring the path up
+// only for Captions; tear it down afterward.
+static bool ensureAudio() {
+  if (audioReady) return true;
+  pinMode(PIN_PA_CTRL, OUTPUT);
+  digitalWrite(PIN_PA_CTRL, LOW);
   i2cWriteReg(ES8311_I2C_ADDR, 0x00, 0x1F);
   delay(10);
 
@@ -538,26 +1014,47 @@ static bool setupMic() {
     return false;
   }
   delay(100);
-  Serial.println("i2s mclk started");
   recoverI2c();
   es8311Init();
   delay(50);
-  Serial.println("es7210 init");
   es7210Init();
   delay(50);
-
-  static int16_t probe[MIC_FRAME_SAMPLES * 2];
-  const size_t got = i2sBus.readBytes((char *)probe, sizeof(probe));
-  logStereoLevels(probe, got / 4, "i2s probe");
+  audioReady = true;
   return true;
+}
+
+static void releaseAudio() {
+  if (!audioReady) return;
+  audioReady = false;
+  delay(40);
+  es7210Write(0x4B, 0x0F);
+  i2cWriteReg(ES8311_I2C_ADDR, 0x32, 0x00);
+  i2cWriteReg(ES8311_I2C_ADDR, 0x00, 0x1F);
+  digitalWrite(PIN_PA_CTRL, LOW);
+  i2sBus.end();
+}
+
+static void setUsbJtagPad(bool on) {
+  if (on) {
+    if (!usbPadOff) return;
+    SET_PERI_REG_MASK(USB_SERIAL_JTAG_CONF0_REG, USB_SERIAL_JTAG_USB_PAD_ENABLE);
+    usbPadOff = false;
+    return;
+  }
+  if (usbPadOff || usb_serial_jtag_is_connected()) return;
+  CLEAR_PERI_REG_MASK(USB_SERIAL_JTAG_CONF0_REG, USB_SERIAL_JTAG_USB_PAD_ENABLE);
+  usbPadOff = true;
 }
 
 static void micCaptureTask(void *) {
   static int16_t stereo[MIC_NOTIFY_SAMPLES * 2];
   MicFrame frame;
-  uint32_t lastLog = 0;
   for (;;) {
     if (!micEnabled && !micFlushPending) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    if (!audioReady) {
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
@@ -568,7 +1065,6 @@ static void micCaptureTask(void *) {
       }
       i2sBus.setTimeout(20);
       if (micQueue) xQueueReset(micQueue);
-      lastLog = millis();
       continue;
     }
     const size_t read = i2sBus.readBytes((char *)stereo, sizeof(stereo));
@@ -592,14 +1088,7 @@ static void micCaptureTask(void *) {
         MicFrame dumped;
         xQueueReceive(micQueue, &dumped, 0);
         xQueueSend(micQueue, &frame, 0);
-        micDrops = micDrops + 1;
       }
-    }
-    const uint32_t now = millis();
-    if (now - lastLog >= 2000) {
-      logStereoLevels(stereo, frames, "mic");
-      Serial.printf("mic qdrops=%u\n", (unsigned)micDrops);
-      lastLog = now;
     }
   }
 }
@@ -623,12 +1112,6 @@ static void pumpMic() {
   lastNotifyMs = nowMs;
   micChar->setValue((uint8_t *)frame.samples, sizeof(frame.samples));
   micChar->notify();
-  micFramesSent++;
-  const uint32_t now = millis();
-  if (now - micLastLogMs >= 2000) {
-    Serial.printf("mic tx=%u drops=%u\n", (unsigned)micFramesSent, (unsigned)micDrops);
-    micLastLogMs = now;
-  }
 }
 
 enum TouchPhase : uint8_t { TP_IDLE, TP_DOWN, TP_WAIT_DOUBLE, TP_HOLD_FIRED };
@@ -643,44 +1126,14 @@ static uint32_t touchReleaseMs = 0;
 static bool touchDown = false;
 static bool touchSecondTap = false;
 
-static void drawGestureHint(const char *name) {
-  gfx->setTextSize(2);
-  const int16_t textW = (int16_t)(strlen(name) * DISPLAY_TEXT_CHAR_W);
-  const int16_t x = (int16_t)(((int)DISPLAY_WIDTH - textW) / 2);
-  const int16_t y = (int16_t)(((int)DISPLAY_HEIGHT - 16) / 2);
-  const int16_t boxX = (int16_t)((max(0, (int)x - 8)) & ~1);
-  const int16_t boxY = (int16_t)((max(0, (int)y - 8)) & ~1);
-  const int16_t boxW = (int16_t)((textW + 16) & ~1);
-  gfx->fillRect(boxX, boxY, boxW, 32, RGB565_BLACK);
-  gfx->setTextColor(RGB565_WHITE);
-  gfx->setCursor(max((int)DISPLAY_TEXT_ORIGIN_X, (int)x), y);
-  gfx->print(name);
-}
-
-static const char *gestureName(uint8_t id) {
-  switch (id) {
-    case GESTURE_SWIPE_UP:
-      return "swipe up";
-    case GESTURE_SWIPE_DOWN:
-      return "swipe down";
-    case GESTURE_SINGLE_TAP:
-      return "tap";
-    case GESTURE_DOUBLE_TAP:
-      return "double tap";
-    case GESTURE_LONG_PRESS:
-      return "hold";
-    default:
-      return "touch";
-  }
-}
-
 static void emitGesture(uint8_t id) {
-  const bool sent = sendEvent(EVT_GESTURE, &id, 1);
-  char line[28];
-  snprintf(
-      line, sizeof(line), "%s%s", gestureName(id), sent ? " ok" : (deviceConnected ? " fail" : " n/c"));
-  drawGestureHint(line);
-  Serial.printf("gesture %u sent=%d connected=%d\n", id, sent ? 1 : 0, deviceConnected ? 1 : 0);
+  if (touchSwallow) return;
+  noteActivity();
+  if (menuOpen) {
+    handleMenuGesture(id);
+    return;
+  }
+  sendEvent(EVT_GESTURE, &id, 1);
 }
 
 static void ft3168Write(uint8_t reg, uint8_t value) {
@@ -764,7 +1217,12 @@ static void pumpTouch() {
     touchLastY = y;
     touchT0 = now;
     touchDown = true;
-    drawGestureHint("touch");
+    if (displayAsleep || touchSwallow) {
+      touchSwallow = true;
+      if (displayAsleep) wakeDisplay();
+      return;
+    }
+    noteActivity();
     return;
   }
 
@@ -781,6 +1239,12 @@ static void pumpTouch() {
 
   if (!down && touchDown) {
     touchDown = false;
+    if (touchSwallow) {
+      touchSwallow = false;
+      touchPhase = TP_IDLE;
+      touchSecondTap = false;
+      return;
+    }
     const int16_t dx = (int16_t)(touchLastX - touchStartX);
     const int16_t dy = (int16_t)(touchLastY - touchStartY);
     const int16_t adx = dx < 0 ? (int16_t)-dx : dx;
@@ -819,25 +1283,198 @@ void setup() {
   }
   gfx->fillScreen(RGB565_BLACK);
   applyBrightness(80);
-  drawIdle("Waiting...");
+  pinMode(PIN_PWR_SENSE, INPUT);
+  pinMode(PIN_BOOT, INPUT_PULLUP);
+  bootWasDown = digitalRead(PIN_BOOT) == LOW;
+  requestIdleFace();
+  drawWatchFace(true);
+  noteActivity();
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   Wire.setClock(100000);
-  if (!setupTouch()) {
-    drawIdle("No touch IC");
+  setupTouch();
+  pinMode(PIN_PA_CTRL, OUTPUT);
+  digitalWrite(PIN_PA_CTRL, LOW);
+  setupPmic();
+  if (idleFace) {
+    drawWatchFace(true);
   }
-  setupMic();
-  micQueue = xQueueCreate(12, sizeof(MicFrame));
+  micQueue = xQueueCreate(24, sizeof(MicFrame));
   xTaskCreatePinnedToCore(micCaptureTask, "miccap", 4096, nullptr, 5, nullptr, 1);
   setupBle();
-  es7210AnalogOn();
+  setupPowerMgmt();
+}
+
+static void pumpPwr() {
+  const bool down = digitalRead(PIN_PWR_SENSE) == HIGH;
+  if (down && !pwrWasDown) {
+    pwrDownMs = millis();
+    pwrHoldSleep = false;
+  }
+  if (down && !pwrHoldSleep && (uint32_t)(millis() - pwrDownMs) >= PWR_SLEEP_HOLD_MS) {
+    pwrHoldSleep = true;
+    if (menuOpen) {
+      closeMenu();
+    }
+    if (displayAsleep) {
+      wakeDisplay();
+    } else {
+      sleepDisplay();
+    }
+  }
+  if (!down && pwrWasDown && !pwrHoldSleep) {
+    noteActivity();
+    if (displayAsleep) {
+      wakeDisplay();
+      openMenu();
+    } else if (menuOpen) {
+      closeMenu();
+      drawWatchFace(true);
+    } else {
+      openMenu();
+    }
+  }
+  pwrWasDown = down;
+}
+
+static void cycleHudColor() {
+  hudColorIndex = (uint8_t)((hudColorIndex + 1) % HUD_PALETTE_COUNT);
+  if (menuOpen) {
+    menuPending = true;
+    return;
+  }
+  if (hudFromJpeg && jpegBuf != nullptr && lastBlitLen >= 4) {
+    jpegLen = lastBlitLen;
+    blitJpeg();
+    return;
+  }
+  if (idleFace) {
+    faceDialDrawn = false;
+    lastShownSec = -1;
+    drawWatchFace(true);
+  }
+}
+
+static void pumpBoot() {
+  const bool down = digitalRead(PIN_BOOT) == LOW;
+  if (down && !bootWasDown) {
+    bootDownMs = millis();
+    bootHoldColor = false;
+    noteActivity();
+    if (displayAsleep) {
+      wakeDisplay();
+    }
+  }
+  if (down && !bootHoldColor && (uint32_t)(millis() - bootDownMs) >= BOOT_COLOR_HOLD_MS) {
+    bootHoldColor = true;
+    cycleHudColor();
+  }
+  if (!down && bootWasDown && !bootHoldColor) {
+    if (menuOpen) {
+      closeMenu();
+      drawWatchFace(true);
+    } else if (!idleFace || hudFromJpeg) {
+      jpegReceiving = false;
+      jpegLen = 0;
+      textPending = false;
+      requestIdleFace();
+      drawWatchFace(true);
+    }
+  }
+  bootWasDown = down;
+}
+
+static void pumpDisplaySleep() {
+  if (wakePending) {
+    wakeDisplay();
+  }
+  if (shouldStayAwake()) {
+    if (displayAsleep) {
+      wakeDisplay();
+    } else {
+      noteActivity();
+    }
+    return;
+  }
+  if (!displayAsleep && (uint32_t)(millis() - lastActivityMs) >= DISPLAY_SLEEP_IDLE_MS) {
+    sleepDisplay();
+  }
+  updateSleepLocks();
 }
 
 void loop() {
   static uint32_t lastTouchMs = 0;
   const uint32_t now = millis();
-  if (!micEnabled || now - lastTouchMs >= 20) {
+  if (audioStartPending && !displayAsleep) {
+    audioStartPending = false;
+    ensureAudio();
+  }
+  if (audioStopPending && !micEnabled) {
+    audioStopPending = false;
+    releaseAudio();
+  }
+  pumpMic();
+  pumpPwr();
+  pumpBoot();
+  pumpBattery();
+  pumpDisplaySleep();
+  if (brightnessPending) {
+    brightnessPending = false;
+    applyBrightness(pendingBrightness);
+  }
+  if (jpegBlitPending) {
+    if (menuOpen) {
+      jpegBlitPending = false;
+      jpegLen = 0;
+      jpegExpected = 0;
+      sendAck(CMD_IMG_END, jpegEndSeq, 0);
+    } else {
+      if (displayAsleep) {
+        wakeDisplay();
+      }
+      jpegBlitPending = false;
+      jpegBusy = true;
+      blitJpeg();
+      idleFace = false;
+      faceDialDrawn = false;
+      hudFromJpeg = true;
+      jpegLen = 0;
+      jpegExpected = 0;
+      jpegBusy = false;
+      sendAck(CMD_IMG_END, jpegEndSeq, 0);
+      noteActivity();
+      lastJpegMs = millis();
+    }
+  }
+  if (menuOpen) {
+    if (menuPending) {
+      menuPending = false;
+      if (displayAsleep) {
+        wakeDisplay();
+      }
+      drawMenu();
+      noteActivity();
+    }
+  } else if (textPending) {
+    if (displayAsleep) {
+      wakeDisplay();
+    }
+    textPending = false;
+    drawTextWall(pendingText);
+    noteActivity();
+  } else if (!displayAsleep) {
+    drawWatchFace(false);
+  }
+  if (displayAsleep && !shouldStayAwake()) {
+    if (digitalRead(PIN_TP_INT) == LOW) {
+      touchSwallow = true;
+      wakeDisplay();
+    }
+  } else if (!micEnabled || now - lastTouchMs >= 20) {
     pumpTouch();
     lastTouchMs = now;
   }
   pumpMic();
+  if (displayAsleep && !shouldStayAwake()) {
+    delay(LIGHT_SLEEP_YIELD_MS);
+  }
 }

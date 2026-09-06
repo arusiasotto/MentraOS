@@ -225,6 +225,17 @@ class DeviceManager {
         get() = DeviceStore.store.get("glasses", "headUp") as? Boolean ?: false
         set(value) = DeviceStore.apply("glasses", "headUp", value)
 
+    private fun isS3Watch(): Boolean = sgc?.type?.contains(DeviceTypes.S3_WATCH) == true
+
+    /** Wrist displays are always in view. Main-view alerts must not wait for head-up. */
+    private fun dashboardVisible(): Boolean = !isS3Watch() && headUp && contextualDashboard
+
+    private fun shouldDispatchView(stateIndex: Int): Boolean {
+        if (isS3Watch() && stateIndex == 0) return true
+        val dash = dashboardVisible()
+        return (stateIndex == 0 && !dash) || (stateIndex == 1 && dash)
+    }
+
     private var micEnabled: Boolean
         get() = DeviceStore.store.get("bluetooth", "micEnabled") as? Boolean ?: false
         set(value) = DeviceStore.apply("bluetooth", "micEnabled", value)
@@ -1001,14 +1012,12 @@ class DeviceManager {
     }
 
     fun sendCurrentState() {
-        val hUp = DeviceStore.get("glasses", "headUp") as? Boolean ?: false
-        // Bridge.log("MAN: sendCurrentState(): $isHeadUp")
         if (screenDisabled) {
             return
         }
 
         // executor.execute {
-        val currentStateIndex = if (hUp && contextualDashboard) 1 else 0
+        val currentStateIndex = if (dashboardVisible()) 1 else 0
         val currentViewState: ViewState = viewStates[currentStateIndex]
 
         if (sgc?.type?.contains(DeviceTypes.SIMULATED) == true) {
@@ -1400,18 +1409,17 @@ class DeviceManager {
             2000
         )
 
-        // Show welcome message on first connect for all display glasses
+        // Show welcome message on first connect for display glasses.
+        // S3 Watch paints its own idle clock; a text wall on pair raced the
+        // QSPI draw and reset the chip.
         if (shouldSendBootingMessage) {
             shouldSendBootingMessage = false
-            executor.execute {
-                sgc?.sendTextWall("// MentraOS Connected")
-                // S3 Watch has no local watch face; leaving the welcome up is
-                // the only way to tell the BLE link painted the panel.
-                if (defaultWearable.contains(DeviceTypes.S3_WATCH)) {
-                    return@execute
+            if (!defaultWearable.contains(DeviceTypes.S3_WATCH)) {
+                executor.execute {
+                    sgc?.sendTextWall("// MentraOS Connected")
+                    Thread.sleep(3000)
+                    sgc?.clearDisplay()
                 }
-                Thread.sleep(3000)
-                sgc?.clearDisplay()
             }
         }
 
@@ -1605,11 +1613,7 @@ class DeviceManager {
         }
 
         viewStates[stateIndex] = newViewState
-        val hUp = headUp && contextualDashboard
-        // send the state we just received if the user is currently in that state:
-        if (stateIndex == 0 && !hUp) {
-            sendCurrentState()
-        } else if (stateIndex == 1 && hUp) {
+        if (shouldDispatchView(stateIndex)) {
             sendCurrentState()
         }
     }
@@ -1646,8 +1650,7 @@ class DeviceManager {
             frame.copy(replay = true, elements = frame.elements.map { it.copy(change = "created") })
         viewStates[stateIndex] = ViewState(" ", " ", " ", "scene", " ", null, null)
 
-        val hUp = headUp && contextualDashboard
-        if ((stateIndex == 0 && !hUp) || (stateIndex == 1 && hUp)) {
+        if (shouldDispatchView(stateIndex)) {
             dispatchSceneFrame(frame)
         }
     }

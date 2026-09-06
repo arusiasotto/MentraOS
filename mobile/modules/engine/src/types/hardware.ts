@@ -57,6 +57,12 @@ export interface DisplayCapabilities {
   shapes?: "rect"[];
   intensityLevels?: number;
   partialUpdate?: boolean;
+  /**
+   * True ⇒ overflowing G2-sized boxes (576×288) are clamped to that
+   * virtual canvas and kept, so the SGC can scale them. Default drops
+   * any image whose box does not fit the public canvas.
+   */
+  fitOverflowImages?: boolean;
 }
 
 /**

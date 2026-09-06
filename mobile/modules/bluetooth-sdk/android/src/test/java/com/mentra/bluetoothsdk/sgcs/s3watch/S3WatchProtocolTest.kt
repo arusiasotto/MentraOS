@@ -24,4 +24,24 @@ class S3WatchProtocolTest {
         assertThat(S3WatchProtocol.gestureName(S3WatchProtocol.GESTURE_LONG_PRESS)).isEqualTo("long_press")
         assertThat(S3WatchProtocol.gestureName(0x7F.toByte())).isNull()
     }
+
+    @Test
+    fun encodeMenuWritesCountRunningAndTruncatedNames() {
+        val encoded =
+            S3WatchProtocol.encodeMenu(
+                listOf(
+                    S3WatchProtocol.MenuEntry(true, "Captions"),
+                    S3WatchProtocol.MenuEntry(false, "ThisNameIsWayTooLong"),
+                )
+            )
+        assertThat(encoded[0]).isEqualTo(2)
+        assertThat(encoded[1]).isEqualTo(1)
+        assertThat(encoded[2]).isEqualTo(8)
+        assertThat(String(encoded, 3, 8, Charsets.UTF_8)).isEqualTo("Captions")
+        val second = 3 + 8
+        assertThat(encoded[second]).isEqualTo(0)
+        assertThat(encoded[second + 1].toInt() and 0xFF).isEqualTo(S3WatchProtocol.MENU_NAME_MAX)
+        assertThat(String(encoded, second + 2, S3WatchProtocol.MENU_NAME_MAX, Charsets.UTF_8))
+            .isEqualTo("ThisNameIsWayTo")
+    }
 }
