@@ -70,6 +70,7 @@ class S3Watch : SGCManager() {
     private var writeInFlight = false
     private var seq = 1
     private var negotiatedMtu = 23
+    private var pcmPackets = 0
 
     init {
         type = DeviceTypes.S3_WATCH
@@ -78,6 +79,7 @@ class S3Watch : SGCManager() {
     }
 
     override fun setMicEnabled(enabled: Boolean) {
+        Bridge.log("$TAG: setMicEnabled $enabled")
         DeviceStore.apply("glasses", "micEnabled", enabled)
         enqueueControl(S3WatchProtocol.CMD_MIC_ENABLE, byteArrayOf(if (enabled) 1 else 0))
     }
@@ -112,6 +114,7 @@ class S3Watch : SGCManager() {
     }
 
     override fun clearDisplay() {
+        Bridge.log("$TAG: clearDisplay")
         enqueueControl(S3WatchProtocol.CMD_CLEAR)
     }
 
@@ -120,6 +123,7 @@ class S3Watch : SGCManager() {
     }
 
     override fun sendTextWall(text: String) {
+        Bridge.log("$TAG: textWall ${text.take(48)}")
         enqueueControl(S3WatchProtocol.CMD_TEXT, text.toByteArray(StandardCharsets.UTF_8))
     }
 
@@ -135,12 +139,14 @@ class S3Watch : SGCManager() {
         height: Int?,
     ): Boolean {
         val jpeg = decodeToJpeg(base64ImageData) ?: return false
+        Bridge.log("$TAG: displayBitmap jpeg=${jpeg.size}")
         sendJpeg(jpeg)
         return true
     }
 
     override fun applySceneFrame(frame: SceneFrame) {
         val jpeg = rasterizeScene(frame) ?: return
+        Bridge.log("$TAG: scene jpeg=${jpeg.size} elements=${frame.elements.size}")
         sendJpeg(jpeg)
     }
 
@@ -434,6 +440,10 @@ class S3Watch : SGCManager() {
         when (uuid) {
             S3WatchProtocol.EVT_UUID -> handleEvent(value)
             S3WatchProtocol.MIC_UUID -> {
+                pcmPackets += 1
+                if (pcmPackets == 1 || pcmPackets % 50 == 0) {
+                    Bridge.log("$TAG: pcm #$pcmPackets ${value.size}b")
+                }
                 DeviceManager.getInstance().reportGlassesAudioActivity()
                 DeviceManager.getInstance().handlePcm(value)
             }
@@ -469,6 +479,7 @@ class S3Watch : SGCManager() {
         DeviceStore.apply("glasses", "deviceModel", type)
         updateConnectionState(ConnTypes.CONNECTED)
         sendSetSystemTime(System.currentTimeMillis())
+        handler.post { pumpWrites() }
     }
 
     private fun handleEvent(packet: ByteArray) {
@@ -485,6 +496,7 @@ class S3Watch : SGCManager() {
             S3WatchProtocol.EVT_GESTURE -> {
                 if (payload.isEmpty()) return
                 val name = S3WatchProtocol.gestureName(payload[0]) ?: return
+                Bridge.log("$TAG: gesture $name")
                 Bridge.sendTouchEvent(type, name, System.currentTimeMillis())
             }
             else -> {}
@@ -492,9 +504,10 @@ class S3Watch : SGCManager() {
     }
 
     private fun enqueueControl(opcode: Byte, payload: ByteArray = ByteArray(0)) {
-        val packet = S3WatchProtocol.encode(opcode, nextSeq(), payload)
-        writeQueue.add(WriteOp(S3WatchProtocol.CTRL_UUID, packet, noResponse = false))
-        pumpWrites()
+        handler.post {
+            writeQueue.add(WriteOp(S3WatchProtocol.CTRL_UUID, encodeControl(opcode, payload), false))
+            pumpWrites()
+        }
     }
 
     private fun sendJpeg(jpeg: ByteArray) {
@@ -509,15 +522,22 @@ class S3Watch : SGCManager() {
                 (S3WatchProtocol.DISPLAY_HEIGHT and 0xFF).toByte(),
                 ((S3WatchProtocol.DISPLAY_HEIGHT shr 8) and 0xFF).toByte(),
             )
-        enqueueControl(S3WatchProtocol.CMD_IMG_BEGIN, begin)
-        val chunkSize = (negotiatedMtu - 3).coerceIn(20, 180)
-        var offset = 0
-        while (offset < jpeg.size) {
-            val end = (offset + chunkSize).coerceAtMost(jpeg.size)
-            writeQueue.add(WriteOp(S3WatchProtocol.IMG_UUID, jpeg.copyOfRange(offset, end), noResponse = true))
-            offset = end
+        handler.post {
+            writeQueue.add(WriteOp(S3WatchProtocol.CTRL_UUID, encodeControl(S3WatchProtocol.CMD_IMG_BEGIN, begin), false))
+            val chunkSize = (negotiatedMtu - 3).coerceIn(20, 180)
+            var offset = 0
+            while (offset < jpeg.size) {
+                val end = (offset + chunkSize).coerceAtMost(jpeg.size)
+                writeQueue.add(WriteOp(S3WatchProtocol.IMG_UUID, jpeg.copyOfRange(offset, end), noResponse = true))
+                offset = end
+            }
+            writeQueue.add(WriteOp(S3WatchProtocol.CTRL_UUID, encodeControl(S3WatchProtocol.CMD_IMG_END), false))
+            pumpWrites()
         }
-        enqueueControl(S3WatchProtocol.CMD_IMG_END)
+    }
+
+    private fun encodeControl(opcode: Byte, payload: ByteArray = ByteArray(0)): ByteArray {
+        return S3WatchProtocol.encode(opcode, nextSeq(), payload)
     }
 
     private fun pumpWrites() {
@@ -582,8 +602,10 @@ class S3Watch : SGCManager() {
         val textPaint =
             Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.WHITE
-                textSize = 22f
+                textSize = 32f
             }
+        val insetX = 16f
+        val insetY = 64f
         for (el in frame.elements) {
             when (el.type) {
                 "rect" -> {
@@ -598,7 +620,9 @@ class S3Watch : SGCManager() {
                 "text" -> {
                     val text = el.text.orEmpty()
                     val fm = textPaint.fontMetrics
-                    canvas.drawText(text, el.x.toFloat(), el.y - fm.ascent, textPaint)
+                    val x = maxOf(el.x.toFloat(), insetX)
+                    val y = maxOf(el.y.toFloat(), insetY)
+                    canvas.drawText(text, x, y - fm.ascent, textPaint)
                 }
                 "image" -> {
                     val data = el.data ?: continue
@@ -670,6 +694,7 @@ class S3Watch : SGCManager() {
         evtChar = null
         imgChar = null
         micChar = null
+        pcmPackets = 0
         try {
             gatt?.disconnect()
             gatt?.close()
