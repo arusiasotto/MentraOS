@@ -52,7 +52,16 @@ export default function SelectGlassesModelScreen() {
       case DeviceTypes.Z100:
         return <VuzixLogo color={theme.colors.text} />
       case DeviceTypes.S3_WATCH:
-        return <Text text="Waveshare (unofficial)" className="text-foreground font-semibold text-lg" />
+        return (
+          <Text
+            text={
+              Platform.OS === "ios"
+                ? "Waveshare (unofficial, iOS untested alpha)"
+                : "Waveshare (unofficial)"
+            }
+            className="text-foreground font-semibold text-lg"
+          />
+        )
       case DeviceTypes.NIMO:
         return <NimoLogo />
       default:

@@ -722,6 +722,9 @@ struct ViewState {
             sgc = Nimo()
         } else if wearable.contains(DeviceTypes.AR99) {
             sgc = Ar99()
+        } else if wearable.contains(DeviceTypes.S3_WATCH) {
+            // UNTESTED ALPHA: iOS S3 Watch SGC has never been run on hardware.
+            sgc = S3Watch()
         } else if wearable.contains(DeviceTypes.FRAME) {
             // sgc = FrameManager()
         }
@@ -1052,14 +1055,18 @@ struct ViewState {
             sgc.setDashboardPosition(h, d)
         }
 
-        // Show welcome message on first connect for all display glasses
+        // Show welcome message on first connect for display glasses.
+        // S3 Watch paints its own idle clock; a text wall on pair raced the
+        // QSPI draw and reset the chip on Android. Skip here too (iOS untested alpha).
         if shouldSendBootingMessage {
-            Task {
-                await sgc.sendTextWall("// MentraOS Connected")
-                try? await Task.sleep(nanoseconds: 3_000_000_000) // 1 second
-                sgc.clearDisplay()
-            }
             shouldSendBootingMessage = false
+            if !sgc.type.contains(DeviceTypes.S3_WATCH) {
+                Task {
+                    await sgc.sendTextWall("// MentraOS Connected")
+                    try? await Task.sleep(nanoseconds: 3_000_000_000) // 1 second
+                    sgc.clearDisplay()
+                }
+            }
         }
 
         // Call device-specific setup handlers
@@ -1763,7 +1770,9 @@ struct ViewState {
             return
         }
         let reconnectTarget =
-            if defaultWearable.contains(DeviceTypes.AR99), !deviceAddress.isEmpty {
+            if (defaultWearable.contains(DeviceTypes.AR99) || defaultWearable.contains(DeviceTypes.S3_WATCH)),
+               !deviceAddress.isEmpty
+            {
                 deviceAddress
             } else {
                 deviceName

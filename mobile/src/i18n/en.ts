@@ -239,7 +239,7 @@ const en = {
     },
     S3_WATCH: {
       disclaimer:
-        "Unofficial community project. Not affiliated with, endorsed by, or a product of Waveshare.",
+        "Unofficial community project. Not affiliated with, endorsed by, or a product of Waveshare. Android is the tested path. The iOS driver is untested alpha work — it has never been run on a Mac or iPhone.",
       step1: "Power on the ESP32-S3-Touch-AMOLED-2.06 (Waveshare kit, unofficial) and wait for the pairing screen.",
       step2: "The watch advertises as S3Watch-XXXX. Stay close to your phone while Mentra scans.",
     },

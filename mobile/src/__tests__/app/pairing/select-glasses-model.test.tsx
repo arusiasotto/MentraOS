@@ -105,7 +105,7 @@ describe("glasses model selection", () => {
 
   it("labels the ESP32-S3 Watch as unofficial Waveshare hardware", () => {
     const {getByText} = render(<SelectGlassesModelScreen />)
-    expect(getByText("Waveshare (unofficial)")).toBeTruthy()
+    expect(getByText(/Waveshare \(unofficial\)/)).toBeTruthy()
   })
 
   it("opens prep for the ESP32-S3 Watch", () => {
