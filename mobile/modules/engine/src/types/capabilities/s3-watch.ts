@@ -18,24 +18,25 @@ export const s3Watch: Capabilities = {
   hasDisplay: true,
   display: {
     count: 1,
-    isColor: true,
-    color: "full_color",
+    isColor: false,
+    color: "green",
     canDisplayBitmap: true,
     resolution: { width: 410, height: 502 },
-    maxTextLines: 16,
+    maxTextLines: 10,
     adjustBrightness: true,
 
-    width: 410,
-    height: 502,
-    // v1: degrade scenes to text walls. The CO5300 JPEG path is still used
-    // for displayBitmap; positioned scenes were painting at y=0 (under the
-    // rounded corner) so Captions looked like a black screen.
-    canPosition: false,
-    maxTextElements: 16,
-    maxImageElements: 1,
-    maxImagePx: { width: 410, height: 502 },
+    // Public canvas is the AMOLED safe area. G2-hardcoded 576×288 boxes
+    // are kept via fitOverflowImages; the SGC letterboxes those frames.
+    width: 378,
+    height: 414,
+    canPosition: true,
+    maxTextElements: 6,
+    maxImageElements: 4,
+    maxImagePx: { width: 378, height: 414 },
     shapes: ["rect"],
+    intensityLevels: 2,
     partialUpdate: false,
+    fitOverflowImages: true,
   },
 
   hasMicrophone: true,

@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/@mentra/miniapp-cli/schema/miniapp.schema.json",
+  "packageName": "com.mentra.watchgestures",
+  "version": "1.0.0",
+  "name": "Watch Gestures",
+  "description": "Shows the last tap or swipe on the wearable so you can verify the input path.",
+  "icon": "icon.png",
+  "type": "standard",
+  "sdkVersion": "0.3.0",
+  "minHostVersion": "1.42.0",
+  "entry": {
+    "background": "background/index.js",
+    "ui": "ui/index.html"
+  },
+  "hardwareRequirements": [
+    {
+      "type": "DISPLAY",
+      "level": "OPTIONAL",
+      "description": "Shows the last gesture on a wearable display; the phone UI works without one."
+    }
+  ]
+}

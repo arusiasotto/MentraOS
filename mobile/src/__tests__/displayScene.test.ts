@@ -163,6 +163,15 @@ describe("processScene", () => {
     expect(dropped).toEqual(["m"])
   })
 
+  it("keeps G2-sized overflowing images when fitOverflowImages is set", () => {
+    const caps = {...CAPS, width: 378, height: 414, maxImagePx: {width: 378, height: 414}, fitOverflowImages: true}
+    const {elements, dropped, degraded} = processScene([imgEl("bmp", 144, 0, 288, 288)], caps, NEX_PROFILE)
+    expect(dropped).toEqual([])
+    expect(elements).toHaveLength(1)
+    expect(elements[0].box).toEqual({x: 144, y: 0, w: 288, h: 288})
+    expect(degraded).toBe(false)
+  })
+
   it("drops images exceeding maxImagePx", () => {
     const {dropped, degraded} = processScene([imgEl("big", 0, 0, 300, 150)], CAPS, NEX_PROFILE)
     expect(dropped).toEqual(["big"])

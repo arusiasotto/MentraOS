@@ -96,6 +96,8 @@ export interface SceneDisplayCapabilities {
   shapes: "rect"[]
   intensityLevels: number
   partialUpdate: boolean
+  /** Keep G2-sized overflowing boxes (clamp to 576×288) instead of dropping images. */
+  fitOverflowImages?: boolean
 }
 
 /** Result of processing a scene — feeds the awaitable render() result. */
