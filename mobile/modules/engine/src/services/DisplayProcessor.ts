@@ -20,6 +20,7 @@ import {
   Z100_PROFILE,
   NEX_PROFILE,
   NIMO_PROFILE,
+  S3_WATCH_PROFILE,
   TextMeasurer,
   TextWrapper,
   ColumnComposer,
@@ -41,7 +42,7 @@ import {isGlassesConnected} from "./GlassesReadiness"
 /**
  * Supported device models for display processing
  */
-export type DeviceModel = "g1" | "g2" | "z100" | "nex" | "nimo" | "mach1" | "mentra-live" | "simulated" | "unknown"
+export type DeviceModel = "g1" | "g2" | "z100" | "nex" | "nimo" | "mach1" | "mentra-live" | "simulated" | "s3-watch" | "unknown"
 
 /**
  * Display event types that we process
@@ -215,6 +216,7 @@ const DEVICE_PROFILES: Record<DeviceModel, DisplayProfile> = {
   "mach1": Z100_PROFILE, // Mach1 uses same hardware as Vuzix Z100
   "mentra-live": G1_PROFILE, // Mentra Live has no display, uses G1 as fallback
   "simulated": G1_PROFILE, // Simulated uses G1 profile
+  "s3-watch": S3_WATCH_PROFILE,
   "unknown": G1_PROFILE, // Default to G1
 }
 
@@ -249,6 +251,9 @@ function normalizeModelName(modelName: string | null | undefined): DeviceModel {
   }
   if (lower.includes("simulated") || lower.includes("simulator")) {
     return "simulated"
+  }
+  if (lower.includes("s3-watch") || lower.includes("s3 watch") || lower.includes("esp32-s3")) {
+    return "s3-watch"
   }
 
   return "unknown"
@@ -382,6 +387,9 @@ export class DisplayProcessor {
 
     this.deviceModel = normalizedModel
     const newProfile = DEVICE_PROFILES[normalizedModel]
+    if (normalizedModel === "s3-watch") {
+      this.options.breakMode = "word"
+    }
 
     if (newProfile !== this.profile) {
       this.updateProfile(newProfile)

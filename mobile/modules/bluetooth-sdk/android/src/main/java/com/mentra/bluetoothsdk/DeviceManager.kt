@@ -1570,6 +1570,11 @@ class DeviceManager internal constructor(initializeHardware: Boolean) {
                 executor.execute {
                     if (sgc !== device) return@execute
                     device.sendTextWall("// MentraOS Connected")
+                    // S3 Watch has no local watch face; leaving the welcome up is
+                    // the only way to tell the BLE link painted the panel.
+                    if (defaultWearable.contains(DeviceTypes.S3_WATCH)) {
+                        return@execute
+                    }
                     Thread.sleep(3000)
                     if (sgc === device) device.clearDisplay()
                 }

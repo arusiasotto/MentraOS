@@ -29,3 +29,6 @@ export {NEX_PROFILE, NEX_HYPHEN_WIDTH_PX, NEX_SPACE_WIDTH_PX} from "./nex"
 
 // NIMO Dynamic Layout V1
 export {NIMO_PROFILE} from "./nimo"
+
+// ESP32-S3 Watch
+export {S3_WATCH_PROFILE, S3_WATCH_HYPHEN_WIDTH_PX, S3_WATCH_SPACE_WIDTH_PX} from "./s3-watch"

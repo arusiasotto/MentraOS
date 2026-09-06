@@ -27,9 +27,12 @@ export const s3Watch: Capabilities = {
 
     width: 410,
     height: 502,
-    canPosition: true,
-    maxTextElements: 32,
-    maxImageElements: 8,
+    // v1: degrade scenes to text walls. The CO5300 JPEG path is still used
+    // for displayBitmap; positioned scenes were painting at y=0 (under the
+    // rounded corner) so Captions looked like a black screen.
+    canPosition: false,
+    maxTextElements: 16,
+    maxImageElements: 1,
     maxImagePx: { width: 410, height: 502 },
     shapes: ["rect"],
     partialUpdate: false,
