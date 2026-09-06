@@ -1,8 +1,11 @@
 # ESP32-S3 Watch — controls and features
 
 Unofficial MentraOS firmware for the Waveshare **ESP32-S3-Touch-AMOLED-2.06**.
-Use the **Watch** Mentra App (`com.mentra.mentra.watch`). Pair the device named
-`S3Watch-XXXX`.
+Use the **Watch** Mentra App (`com.mentra.mentra.watch`) on Android. Pair the
+device named `S3Watch-XXXX`.
+
+**iOS is untested alpha.** The Mentra App on iPhone can list the watch, but the
+native driver has never been run on hardware.
 
 This is not a Waveshare product and is not affiliated with Waveshare.
 

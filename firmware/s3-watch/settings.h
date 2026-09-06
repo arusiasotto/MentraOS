@@ -5,9 +5,10 @@
 // Unofficial MentraOS firmware for Waveshare ESP32-S3-Touch-AMOLED-2.06.
 // Not a Waveshare product; not affiliated with or endorsed by Waveshare.
 // =============================================================================
-// Phone driver:
-//   mobile/modules/bluetooth-sdk/android/.../sgcs/s3watch/S3WatchProtocol.kt
-// Keep UUIDs, opcodes, and framing in lockstep with that file.
+// Phone drivers:
+//   Android (tested): .../sgcs/s3watch/S3WatchProtocol.kt
+//   iOS (UNTESTED ALPHA): .../sgcs/s3watch/S3WatchProtocol.swift
+// Keep UUIDs, opcodes, and framing in lockstep with those files.
 // =============================================================================
 
 #define ADV_NAME_PREFIX "S3Watch"

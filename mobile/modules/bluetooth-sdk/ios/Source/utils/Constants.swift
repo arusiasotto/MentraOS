@@ -9,6 +9,8 @@ struct DeviceTypes {
     static let FRAME = "Brilliant Frame"
     static let NIMO = "NIMO"
     static let AR99 = "AR99"
+    /// Unofficial Waveshare ESP32-S3 watch. iOS SGC is untested alpha.
+    static let S3_WATCH = "ESP32-S3 Watch"
 
     static let ALL = [
         SIMULATED,
@@ -21,6 +23,7 @@ struct DeviceTypes {
         FRAME,
         NIMO,
         AR99,
+        S3_WATCH,
     ]
 
     /// Private init to prevent instantiation

@@ -6,10 +6,14 @@ board, advertised to the Mentra Android app as `ESP32-S3 Watch`.
 **This is not a Waveshare product.** It is not affiliated with, endorsed by, or
 supported by Waveshare Electronics. Use at your own risk.
 
-The phone driver is
+The tested phone driver is
 `mobile/modules/bluetooth-sdk/android/.../sgcs/S3Watch.kt`.
 UUIDs and opcodes live in [`settings.h`](settings.h) and
-`S3WatchProtocol.kt` — keep them identical.
+`S3WatchProtocol.kt` / `S3WatchProtocol.swift` — keep them identical.
+
+**iOS is untested alpha.** `S3Watch.swift` and `S3WatchProtocol.swift` have
+never been compiled or run on a Mac / iPhone. Do not treat iOS pairing as
+supported.
 
 ## Identity
 

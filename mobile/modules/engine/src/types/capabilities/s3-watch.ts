@@ -5,6 +5,9 @@
  * single-display wearable (text, JPEG images, microphone). Unofficial
  * community support — not a Waveshare product and not affiliated with
  * Waveshare.
+ *
+ * The iOS Bluetooth SGC (`S3Watch.swift`) is untested alpha and has never
+ * been run on a Mac or iPhone.
  */
 
 import type { Capabilities } from "../hardware";
