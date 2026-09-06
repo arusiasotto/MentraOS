@@ -41,6 +41,7 @@ import {ensureDevModeForUser} from "@/utils/dev/devModeAllowlist"
 import mentraAuth from "@/utils/auth/authClient"
 import {showAlert} from "@/utils/AlertUtils"
 import {translate} from "@/i18n"
+import {checkAndRequestNotificationAccessSpecialPermission} from "@/utils/NotificationServiceUtils"
 import {Buffer} from "@craftzdog/react-native-buffer"
 import {createDeploymentAuthProvider, deploymentStore} from "@/services/deployment"
 
@@ -112,6 +113,7 @@ class MantleManager {
   private miniappInitialization: Promise<void> | null = null
   private foregroundMiniappSyncNeeded = false
   private activePhoneNotificationId: string | null = null
+  private notificationAccessPrompted = false
   /** A notification is being read aloud right now. */
   private speakingNotification: boolean = false
   /** When the last announcement finished, for the quiet window. */
@@ -135,6 +137,32 @@ class MantleManager {
     return useAppStatusStore
       .getState()
       .apps.some((miniapp) => miniapp.packageName === notifyPackageName && miniapp.running)
+  }
+
+  private isS3Watch(): boolean {
+    return (engine.glasses.info().model || "").includes("S3 Watch")
+  }
+
+  /** Wrist has no look-up and Notify is easy to leave off. Still paint the card. */
+  private shouldPresentPhoneNotification(): boolean {
+    return this.isNotifyRunning() || this.isS3Watch()
+  }
+
+  private async ensureWatchNotificationAccess(): Promise<void> {
+    if (this.notificationAccessPrompted || Platform.OS !== "android") return
+    this.notificationAccessPrompted = true
+    try {
+      const hasAccess = await CrustModule.hasNotificationListenerPermission()
+      if (hasAccess) {
+        // RedMagic/ZTE can leave an approved listener unbound across process
+        // starts. requestRebind only ran when the component first flipped on.
+        await CrustModule.refreshNotificationListener()
+        return
+      }
+      await checkAndRequestNotificationAccessSpecialPermission()
+    } catch (error) {
+      console.warn("MANTLE: watch notification-access prompt failed", error)
+    }
   }
 
   /**
@@ -1012,9 +1040,15 @@ class MantleManager {
       if (glassesWereConnected && !glassesAreConnected) {
         this.stopPhoneNotificationPresentation()
       }
+      if (glassesAreConnected && this.isS3Watch()) {
+        void this.ensureWatchNotificationAccess()
+      }
       glassesWereConnected = glassesAreConnected
     })
     this.subs.push({remove: unsubscribeGlassesPresentationState})
+    if (glassesWereConnected && this.isS3Watch()) {
+      void this.ensureWatchNotificationAccess()
+    }
 
     // (The device-status projection — onBluetoothStatus -> core store and
     // onGlassesStatus -> glasses store — moved into island's GlassesStatusProjection,
@@ -1118,7 +1152,8 @@ class MantleManager {
         // Capture/forwarding is independent from presentation. Notify is the
         // user-controlled presentation surface: if it is not running, no card
         // and no speech may interrupt the wearer on either platform.
-        if (!this.isNotifyRunning()) return
+        // The S3 Watch still paints the card when Notify is off.
+        if (!this.shouldPresentPhoneNotification()) return
         // One presentation owner: firmware history/popups replace the Mentra card.
         // Miniapp forwarding above stays independent. A failed native upload must
         // not fall back to a second overlay whose delivery cannot be correlated.
@@ -1142,13 +1177,14 @@ class MantleManager {
         const displayTitle = title && title !== app ? [app, title].filter(Boolean).join(": ") : title || app
         if (displayTitle || content) {
           this.activePhoneNotificationId = notificationId || null
+          const isS3Watch = (engine.glasses.info().model || "").includes("S3 Watch")
           localDisplayManager.request(notifyPackageName, {
             layout: {
               layoutType: "reference_card",
               title: displayTitle || "Notification",
               text: content,
             },
-            durationMs: 5_000,
+            durationMs: isS3Watch ? 15_000 : 5_000,
           })
           // Glasses with no screen (Mentra Live) would otherwise get nothing at
           // all from the card above — the notification arrives and is stored,

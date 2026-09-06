@@ -282,6 +282,7 @@ class NotificationListener private constructor(private val context: Context) {
   private val messagingAppAllowlist =
     setOf(
       "com.google.android.apps.messaging",
+      "com.google.android.apps.googlevoice",
       "com.samsung.android.messaging",
       "com.android.mms",
       "com.google.android.gm",
@@ -325,8 +326,15 @@ class NotificationListener private constructor(private val context: Context) {
 
     val notification = sbn.notification
     val extras = notification.extras
-    val title = extras.getCharSequence("android.title")?.toString() ?: ""
-    val text = extras.getCharSequence("android.text")?.toString() ?: ""
+    val title =
+      extras.getCharSequence("android.title")?.toString()
+        ?: extras.getCharSequence("android.conversationTitle")?.toString()
+        ?: ""
+    val text =
+      extras.getCharSequence("android.text")?.toString()
+        ?: extras.getCharSequence("android.bigText")?.toString()
+        ?: extras.getCharSequence("android.subText")?.toString()
+        ?: ""
 
     if (title.isEmpty() && text.isEmpty()) {
       Log.d(TAG, "Ignoring empty notification")

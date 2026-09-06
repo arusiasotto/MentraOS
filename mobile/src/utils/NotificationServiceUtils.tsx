@@ -1,4 +1,5 @@
 import {AppState, Platform} from "react-native"
+import Constants from "expo-constants"
 import CrustModule from "@mentra/crust"
 
 import showAlert from "@/utils/AlertUtils"
@@ -49,11 +50,12 @@ export async function checkAndRequestNotificationAccessSpecialPermission(): Prom
       }
     }
 
+    const appLabel = Constants.expoConfig?.name || "MentraOS"
     showAlert(
       "Enable Notification Access",
-      "MentraOS needs permission to read your phone notifications to display them on your smart glasses.\n\n" +
+      `${appLabel} needs permission to read your phone notifications to display them on your wearable.\n\n` +
         "On the next screen:\n" +
-        '1. Find "MentraOS" in the list\n' +
+        `1. Find "${appLabel}" in the list (not the regular Mentra app)\n` +
         '2. Toggle the switch to "on"\n' +
         '3. Tap "Allow" when prompted',
       [
