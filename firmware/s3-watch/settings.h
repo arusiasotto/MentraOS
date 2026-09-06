@@ -48,6 +48,16 @@ constexpr uint8_t GESTURE_LONG_PRESS = 0x05;
 
 constexpr uint16_t DISPLAY_WIDTH = 410;
 constexpr uint16_t DISPLAY_HEIGHT = 502;
+// CO5300 GRAM is wider than the glass. Visible 410 cols start at column 22
+// (Waveshare 01_HelloWorld). Without this, text shifts left and a green
+// leftover strip appears on the right.
+constexpr uint8_t DISPLAY_COL_OFFSET = 22;
+constexpr uint8_t DISPLAY_ROW_OFFSET = 0;
+// Keep text below the AMOLED corner radius so the first line is not clipped.
+constexpr uint16_t DISPLAY_TEXT_ORIGIN_X = 16;
+constexpr uint16_t DISPLAY_TEXT_ORIGIN_Y = 64;
+constexpr uint16_t DISPLAY_TEXT_LINE_H = 28;
+constexpr uint16_t DISPLAY_TEXT_CHAR_W = 12;
 
 constexpr uint16_t MIC_SAMPLE_RATE = 16000;
 constexpr uint8_t MIC_CHANNELS = 1;
@@ -76,8 +86,12 @@ constexpr uint16_t GESTURE_SWIPE_MIN_PX = 48;
 constexpr uint8_t PIN_I2S_MCLK = 16;
 constexpr uint8_t PIN_I2S_BCLK = 41;
 constexpr uint8_t PIN_I2S_LRCK = 45;
+constexpr uint8_t PIN_I2S_DOUT = 40;  // ES8311; duplex so the S3 actually emits MCLK
 constexpr uint8_t PIN_I2S_DIN = 42;
 
 constexpr uint8_t ES7210_I2C_ADDR = 0x40;
+constexpr uint8_t ES8311_I2C_ADDR = 0x18;
+constexpr uint8_t AXP2101_I2C_ADDR = 0x34;
+constexpr uint8_t PIN_PA_CTRL = 46;
 
 constexpr int8_t TX_POWER_DBM = 0;
