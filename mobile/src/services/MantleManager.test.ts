@@ -379,6 +379,33 @@ describe("MantleManager", () => {
     await Promise.resolve()
   })
 
+  it("presents notifications on the S3 watch even when Notify is not running", () => {
+    ;(engine.glasses.info as jest.Mock).mockReturnValue({model: "ESP32-S3 Watch"})
+
+    emitCrustEvent("phone_notification", {
+      notificationId: "n-watch",
+      app: "Messages",
+      title: "Hello",
+      content: "On the wrist",
+      priority: 0,
+      timestamp: "12345",
+      packageName: "com.google.android.apps.messaging",
+    })
+
+    expect(localDisplayManager.request).toHaveBeenCalledWith(
+      "cloud.augmentos.notify",
+      expect.objectContaining({
+        durationMs: 15_000,
+        layout: expect.objectContaining({
+          layoutType: "reference_card",
+          title: "Messages: Hello",
+          text: "On the wrist",
+        }),
+      }),
+    )
+    ;(engine.glasses.info as jest.Mock).mockReturnValue({})
+  })
+
   it("forwards notifications without presenting them when Notify is not running", () => {
     const forwardEvent = jest.spyOn(localMiniappRuntime, "forwardEvent")
 
