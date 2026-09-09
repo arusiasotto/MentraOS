@@ -13,6 +13,12 @@
  * The task is registered at module load (the export from `index.ts` evaluates this
  * file as soon as `@mentra/engine` is imported), matching the old MantleManager
  * top-level `defineTask` timing — including on a headless background relaunch.
+ *
+ * Live `location_update` streams must start as an Android location foreground
+ * service. The Mentra App APK blocks `ACCESS_BACKGROUND_LOCATION` for Play
+ * Store review, so Expo's default background task is rejected with "Not
+ * authorized to use background location services". A persistent notification
+ * keeps GPS in the while-in-use bucket, which is how navigation already works.
  */
 import * as Location from "expo-location"
 import * as TaskManager from "expo-task-manager"
@@ -20,6 +26,16 @@ import * as TaskManager from "expo-task-manager"
 import localMiniappRuntime from "./LocalMiniappRuntime"
 
 export const LOCATION_TASK_NAME = "handleLocationUpdates"
+
+/**
+ * Persistent notification that keeps GPS running while the Mentra App is
+ * off-screen. Required on Android because background-location permission is
+ * not in the APK.
+ */
+export const LOCATION_FOREGROUND_SERVICE = {
+  notificationTitle: "Mentra is using your location",
+  notificationBody: "Walking games and navigation keep working even when the Mentra App isn't on screen.",
+} as const
 
 // Background location task — sends each fix to the v2 cloud (RestComms) + local
 // miniapps. (The v1 SocketComms leg was already removed/commented before the move.)
@@ -80,11 +96,20 @@ export function getLocationAccuracy(accuracy: string | undefined): Location.Loca
   }
 }
 
+/** Options for the live GPS task at a given aggregate miniapp tier. */
+export function locationTaskOptions(tier: string) {
+  return {
+    accuracy: getLocationAccuracy(tier),
+    pausesUpdatesAutomatically: false,
+    foregroundService: {...LOCATION_FOREGROUND_SERVICE},
+  }
+}
+
 /**
  * Apply a location tier (the aggregate of what miniapps request). "off" means no app
  * is asking — stop the task so the OS can power GPS down; anything else (re)starts the
- * background task at the matching accuracy. Callers gate this on the OS location
- * permission (host UI concern).
+ * location foreground service at the matching accuracy. Callers gate this on the OS
+ * location permission (host UI concern).
  */
 export async function setLocationTier(
   tier: "off" | "passive" | "low" | "high" | "realtime" | string,
@@ -99,10 +124,7 @@ export async function setLocationTier(
       console.log("ISLAND: setLocationTier() stopped — no active subscribers")
       return
     }
-    await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, {
-      accuracy: getLocationAccuracy(tier),
-      pausesUpdatesAutomatically: false,
-    })
+    await Location.startLocationUpdatesAsync(LOCATION_TASK_NAME, locationTaskOptions(tier))
     console.log("ISLAND: setLocationTier() success —", tier)
   } catch (error) {
     console.log("ISLAND: Error setting location tier", error)

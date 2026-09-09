@@ -405,6 +405,10 @@ module.exports = ({config}: ConfigContext): Partial<ExpoConfig> => {
         "expo-location",
         {
           locationAlwaysAndWhenInUsePermission: "Allow Mentra to use your location.",
+          // Live miniapp GPS uses a location foreground service (while-in-use),
+          // not ACCESS_BACKGROUND_LOCATION — see PhoneLocationService.
+          isAndroidForegroundServiceEnabled: true,
+          isAndroidBackgroundLocationEnabled: false,
         },
       ],
       ...(variant.includeFirebase ? ["@react-native-firebase/app"] : []),
