@@ -79,6 +79,7 @@ class SceneRenderer {
       shapes: display.shapes ?? [],
       intensityLevels: display.intensityLevels ?? 2,
       partialUpdate: display.partialUpdate ?? false,
+      fitOverflowImages: display.fitOverflowImages === true,
     }
   }
 

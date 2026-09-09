@@ -11,6 +11,7 @@ import android.os.Handler
 import android.os.Looper
 import androidx.core.content.ContextCompat
 import com.mentra.bluetoothsdk.controllers.ControllerManager
+import com.mentra.bluetoothsdk.controllers.Keyfob
 import com.mentra.bluetoothsdk.controllers.R1
 import com.mentra.bluetoothsdk.services.ForegroundService
 import com.mentra.bluetoothsdk.services.PhoneMic
@@ -25,6 +26,7 @@ import com.mentra.bluetoothsdk.sgcs.MentraNex
 import com.mentra.bluetoothsdk.sgcs.Nimo
 import com.mentra.bluetoothsdk.sgcs.SGCManager
 import com.mentra.bluetoothsdk.sgcs.Simulated
+import com.mentra.bluetoothsdk.sgcs.S3Watch
 import com.mentra.bluetoothsdk.utils.ControllerTypes
 import com.mentra.bluetoothsdk.utils.DeviceTypes
 import com.mentra.bluetoothsdk.utils.MicMap
@@ -222,6 +224,17 @@ class DeviceManager {
     public var headUp: Boolean
         get() = DeviceStore.store.get("glasses", "headUp") as? Boolean ?: false
         set(value) = DeviceStore.apply("glasses", "headUp", value)
+
+    private fun isS3Watch(): Boolean = sgc?.type?.contains(DeviceTypes.S3_WATCH) == true
+
+    /** Wrist displays are always in view. Main-view alerts must not wait for head-up. */
+    private fun dashboardVisible(): Boolean = !isS3Watch() && headUp && contextualDashboard
+
+    private fun shouldDispatchView(stateIndex: Int): Boolean {
+        if (isS3Watch() && stateIndex == 0) return true
+        val dash = dashboardVisible()
+        return (stateIndex == 0 && !dash) || (stateIndex == 1 && dash)
+    }
 
     private var micEnabled: Boolean
         get() = DeviceStore.store.get("bluetooth", "micEnabled") as? Boolean ?: false
@@ -664,7 +677,7 @@ class DeviceManager {
                 " ",
                 " ",
                 "text_wall",
-                "\$TIME12$ \$DATE$ \$GBATT$ \$CONNECTION_STATUS$",
+                DashboardContentFormatter.template(""),
                 null,
                 null
             )
@@ -676,7 +689,7 @@ class DeviceManager {
                 " ",
                 " ",
                 "text_wall",
-                "\$TIME12$ \$DATE$ \$GBATT$ \$CONNECTION_STATUS$",
+                DashboardContentFormatter.template(""),
                 null,
                 null
             )
@@ -722,6 +735,8 @@ class DeviceManager {
     // native re-dispatch coherent (dashboard exit re-applies a complete scene,
     // not whatever element happened to arrive last).
     private val sceneStates = arrayOfNulls<SceneFrame>(2)
+    private var dashboardSceneCleanupPending = false
+    private val pendingDashboardSceneElementIds = linkedSetOf<String>()
     // MARK: - End Unique
 
     // MARK: - Voice Data Handling
@@ -999,14 +1014,12 @@ class DeviceManager {
     }
 
     fun sendCurrentState() {
-        val hUp = DeviceStore.get("glasses", "headUp") as? Boolean ?: false
-        // Bridge.log("MAN: sendCurrentState(): $isHeadUp")
         if (screenDisabled) {
             return
         }
 
         // executor.execute {
-        val currentStateIndex = if (hUp && contextualDashboard) 1 else 0
+        val currentStateIndex = if (dashboardVisible()) 1 else 0
         val currentViewState: ViewState = viewStates[currentStateIndex]
 
         if (sgc?.type?.contains(DeviceTypes.SIMULATED) == true) {
@@ -1019,6 +1032,8 @@ class DeviceManager {
             Bridge.log("MAN: DeviceManager.sendCurrentState(): sgc not ready")
             return
         }
+
+        clearPendingDashboardSceneElements(currentStateIndex)
 
         // Cancel any pending clear display work item
         // sendStateWorkItem?.let { mainHandler.removeCallbacks(it) }
@@ -1250,6 +1265,8 @@ class DeviceManager {
             sgc = MentraNex()
         } else if (wearable.contains(DeviceTypes.AR99)) {
             sgc = Ar99()
+        } else if (wearable.contains(DeviceTypes.S3_WATCH)) {
+            sgc = S3Watch()
         } else if (wearable.contains(DeviceTypes.MACH1)) {
             sgc = createOptionalMach1Sgc(DeviceTypes.MACH1)
         } else if (wearable.contains(DeviceTypes.Z100)) {
@@ -1291,6 +1308,8 @@ class DeviceManager {
 
         if (controllerType == ControllerTypes.R1) {
             controller = R1()
+        } else if (controllerType == ControllerTypes.KEYFOB) {
+            controller = Keyfob()
         }
     }
 
@@ -1394,13 +1413,17 @@ class DeviceManager {
             2000
         )
 
-        // Show welcome message on first connect for all display glasses
+        // Show welcome message on first connect for display glasses.
+        // S3 Watch paints its own idle clock; a text wall on pair raced the
+        // QSPI draw and reset the chip.
         if (shouldSendBootingMessage) {
             shouldSendBootingMessage = false
-            executor.execute {
-                sgc?.sendTextWall("// MentraOS Connected")
-                Thread.sleep(3000)
-                sgc?.clearDisplay()
+            if (!defaultWearable.contains(DeviceTypes.S3_WATCH)) {
+                executor.execute {
+                    sgc?.sendTextWall("// MentraOS Connected")
+                    Thread.sleep(3000)
+                    sgc?.clearDisplay()
+                }
             }
         }
 
@@ -1519,6 +1542,45 @@ class DeviceManager {
         sgc?.clearDisplay()
     }
 
+    internal fun setDashboardContent(content: String) {
+        val nextState =
+            ViewState(
+                " ",
+                " ",
+                " ",
+                "text_wall",
+                DashboardContentFormatter.template(content),
+                null,
+                null,
+            )
+        val previousScene = sceneStates[1]
+        if (previousScene == null && viewStates[1] == nextState) {
+            return
+        }
+
+        previousScene?.let { frame ->
+            dashboardSceneCleanupPending = true
+            pendingDashboardSceneElementIds.addAll(frame.elements.map { it.id })
+        }
+        sceneStates[1] = null
+        viewStates[1] = nextState
+
+        if (headUp && contextualDashboard) {
+            sendCurrentState()
+        }
+    }
+
+    private fun clearPendingDashboardSceneElements(stateIndex: Int) {
+        if (stateIndex != 1 || !dashboardSceneCleanupPending) return
+
+        dashboardSceneCleanupPending = false
+        val elementIds = pendingDashboardSceneElementIds.toList()
+        pendingDashboardSceneElementIds.clear()
+        if (elementIds.isNotEmpty()) {
+            sgc?.clearSceneElements(elementIds)
+        }
+    }
+
     fun displayEvent(event: Map<String, Any>) {
         val view = event["view"] as? String
         if (view == null) {
@@ -1549,7 +1611,9 @@ class DeviceManager {
         // wipes everything anyway.
         sceneStates[stateIndex]?.let { prevFrame ->
             sceneStates[stateIndex] = null
-            if (layoutType != "clear_view") {
+            if (stateIndex == 1 && dashboardSceneCleanupPending) {
+                pendingDashboardSceneElementIds.addAll(prevFrame.elements.map { it.id })
+            } else if (layoutType != "clear_view") {
                 sgc?.clearSceneElements(prevFrame.elements.map { it.id })
             }
         }
@@ -1594,11 +1658,7 @@ class DeviceManager {
         }
 
         viewStates[stateIndex] = newViewState
-        val hUp = headUp && contextualDashboard
-        // send the state we just received if the user is currently in that state:
-        if (stateIndex == 0 && !hUp) {
-            sendCurrentState()
-        } else if (stateIndex == 1 && hUp) {
+        if (shouldDispatchView(stateIndex)) {
             sendCurrentState()
         }
     }
@@ -1614,7 +1674,13 @@ class DeviceManager {
             // clearDisplay is the per-device "wipe what's there" (blank-in-place
             // on G2 — no page rebuild).
             val prevLegacyType = viewStates[stateIndex].layoutType
-            if (prevLegacyType.isNotEmpty() && prevLegacyType != "clear_view" && prevLegacyType != "scene") {
+            val cleanupDeferred = stateIndex == 1 && dashboardSceneCleanupPending
+            if (
+                !cleanupDeferred &&
+                    prevLegacyType.isNotEmpty() &&
+                    prevLegacyType != "clear_view" &&
+                    prevLegacyType != "scene"
+            ) {
                 sgc?.clearDisplay()
             }
         } else if (prevFrame.appId != frame.appId) {
@@ -1624,7 +1690,11 @@ class DeviceManager {
             // them), then paint the new frame from scratch. In practice the
             // boot message interposes between apps, so this isn't visible as a
             // blank.
-            sgc?.clearSceneElements(prevFrame.elements.map { it.id })
+            if (stateIndex == 1 && dashboardSceneCleanupPending) {
+                pendingDashboardSceneElementIds.addAll(prevFrame.elements.map { it.id })
+            } else {
+                sgc?.clearSceneElements(prevFrame.elements.map { it.id })
+            }
             frame = frame.copy(replay = true, elements = frame.elements.map { it.copy(change = "created") })
         }
 
@@ -1635,20 +1705,20 @@ class DeviceManager {
             frame.copy(replay = true, elements = frame.elements.map { it.copy(change = "created") })
         viewStates[stateIndex] = ViewState(" ", " ", " ", "scene", " ", null, null)
 
-        val hUp = headUp && contextualDashboard
-        if ((stateIndex == 0 && !hUp) || (stateIndex == 1 && hUp)) {
-            dispatchSceneFrame(frame)
+        if (shouldDispatchView(stateIndex)) {
+            dispatchSceneFrame(stateIndex, frame)
         }
     }
 
     /** Guarded scene dispatch — mirrors sendCurrentState's send conditions. */
-    private fun dispatchSceneFrame(frame: SceneFrame) {
+    private fun dispatchSceneFrame(stateIndex: Int, frame: SceneFrame) {
         if (screenDisabled) return
         if (sgc?.type?.contains(DeviceTypes.SIMULATED) == true) return
         if (sgc?.fullyBooted != true) {
             Bridge.log("MAN: dispatchSceneFrame(): sgc not ready")
             return
         }
+        clearPendingDashboardSceneElements(stateIndex)
         sgc?.applySceneFrame(frame)
     }
 
@@ -2061,7 +2131,10 @@ class DeviceManager {
             return
         }
         val reconnectTarget =
-            if (defaultWearable.contains(DeviceTypes.AR99) && deviceAddress.isNotBlank()) {
+            if ((defaultWearable.contains(DeviceTypes.AR99) ||
+                    defaultWearable.contains(DeviceTypes.S3_WATCH)) &&
+                deviceAddress.isNotBlank()
+            ) {
                 deviceAddress
             } else {
                 deviceName

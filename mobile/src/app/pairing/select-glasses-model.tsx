@@ -1,4 +1,4 @@
-import {DeviceTypes} from "@mentra/engine"
+import {DeviceTypes, SETTINGS, useSetting} from "@mentra/engine"
 import {useRef} from "react"
 import {View, TouchableOpacity, Platform, ScrollView, Image} from "react-native"
 
@@ -13,13 +13,14 @@ import {Screen} from "@/components/ignite/Screen"
 import {Spacer} from "@/components/ui/Spacer"
 import {useAppTheme} from "@/contexts/ThemeContext"
 import {useNavigationStore} from "@/stores/navigation"
-import {SETTINGS, useSetting} from "@mentra/engine"
 import {AR99_MODEL_OPTIONS, type Ar99ProjectName, getGlassesImage} from "@/utils/getGlassesImage"
 import {preparePairingScan} from "@/utils/pairing/preparePairingScan"
 import GlassView from "@/components/ui/GlassView"
+import {deploymentStore} from "@/services/deployment"
 
 type GlassesOption = {
   key: string
+  modelId: string
   deviceModel: string
   projectName?: Ar99ProjectName
   manufacturerName?: string
@@ -51,6 +52,17 @@ export default function SelectGlassesModelScreen() {
         return <MentraLogo color={theme.colors.text} />
       case DeviceTypes.Z100:
         return <VuzixLogo color={theme.colors.text} />
+      case DeviceTypes.S3_WATCH:
+        return (
+          <Text
+            text={
+              Platform.OS === "ios"
+                ? "Waveshare (unofficial, iOS untested alpha)"
+                : "Waveshare (unofficial)"
+            }
+            className="text-foreground font-semibold text-lg"
+          />
+        )
       case DeviceTypes.NIMO:
         return <NimoLogo />
       default:
@@ -65,6 +77,7 @@ export default function SelectGlassesModelScreen() {
 
   const ar99Options: GlassesOption[] = AR99_MODEL_OPTIONS.map((option) => ({
     key: option.key,
+    modelId: `ar99:${option.projectName.toLowerCase()}`,
     deviceModel: option.deviceModel,
     projectName: option.projectName,
     manufacturerName: option.manufacturerName,
@@ -73,17 +86,22 @@ export default function SelectGlassesModelScreen() {
   }))
 
   const sharedOptions: GlassesOption[] = [
-    {deviceModel: DeviceTypes.LIVE, key: "mentra_live"},
+    {deviceModel: DeviceTypes.LIVE, key: "mentra_live", modelId: "mentra-live"},
     ...ar99Options,
-    {deviceModel: DeviceTypes.G1, key: "evenrealities_g1"},
-    {deviceModel: DeviceTypes.G2, key: "evenrealities_g2"},
-    {deviceModel: DeviceTypes.MACH1, key: "mentra_mach1"},
-    {deviceModel: DeviceTypes.Z100, key: "vuzix-z100"},
-    {deviceModel: DeviceTypes.NEX, key: "mentra_nex"},
-    {deviceModel: DeviceTypes.NIMO, key: "nimo"},
+    {deviceModel: DeviceTypes.G1, key: "evenrealities_g1", modelId: "even-realities-g1"},
+    {deviceModel: DeviceTypes.G2, key: "evenrealities_g2", modelId: "even-realities-g2"},
+    {deviceModel: DeviceTypes.MACH1, key: "mentra_mach1", modelId: "mentra-mach1"},
+    {deviceModel: DeviceTypes.Z100, key: "vuzix-z100", modelId: "vuzix-z100"},
+    {deviceModel: DeviceTypes.S3_WATCH, key: "esp32-s3-watch", modelId: "esp32-s3-watch"},
+    {deviceModel: DeviceTypes.NEX, key: "mentra_nex", modelId: "mentra-display"},
+    {deviceModel: DeviceTypes.NIMO, key: "nimo", modelId: "nimo"},
   ]
 
-  const glassesOptions = Platform.OS === "ios" ? sharedOptions : sharedOptions
+  const deployment = deploymentStore.getActive()
+  const allowedModels = deployment.kind === "workspace" ? deployment.manifest.glasses.allowedModelsOverride : null
+  const glassesOptions = (Platform.OS === "ios" ? sharedOptions : sharedOptions).filter(
+    (option) => allowedModels === null || allowedModels.includes(option.modelId),
+  )
 
   const triggerGlassesPairingGuide = async (option: GlassesOption) => {
     if (option.deviceModel === DeviceTypes.LIVE) {

@@ -83,30 +83,92 @@ jobs:
               ;;
           esac
 
+      - name: Restore the release plan selected by an earlier attempt
+        id: restore-plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          artifacts=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100")
+          matches=$(jq '[.artifacts[] | select(.name | startswith("coordinated-release-plan-"))]' <<< "$artifacts")
+          count=$(jq 'length' <<< "$matches")
+          if (( count > 1 )); then
+            echo "Run $GITHUB_RUN_ID has $count release-plan artifacts; refusing an ambiguous retry." >&2
+            exit 1
+          fi
+          if (( count == 0 )); then
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$(jq -r '.[0].expired' <<< "$matches")" != "false" ]]; then
+            echo "The immutable release plan for run $GITHUB_RUN_ID has expired; allocate a new release instead." >&2
+            exit 1
+          fi
+          artifact=$(jq -er '.[0].name' <<< "$matches")
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$artifact" --dir restored-plan
+          cp restored-plan/release-plan.json release-plan.json
+          jq -e .starterKitSource release-plan.json > starter-kit-source.json
+          echo "restored=true" >> "$GITHUB_OUTPUT"
+
       - name: Collect promoted firmware inputs
         run: node .github/scripts/collect-ota-release-inputs.mjs
 
       - name: Verify generated changelog catalogs
         run: node .github/scripts/generate-changelog-catalog.mjs --check
 
+      - name: Freeze the Starter Kit channel source
+        if: steps.restore-plan.outputs.restored != 'true'
+        run: |
+          set -euo pipefail
+          starter_repository=Mentra-Community/Mentra-Bluetooth-SDK-Starter-Kit
+          case "${{ github.ref_name }}" in
+            dev) starter_branch=dev ;;
+            staging)
+              starter_branch=staging
+              starter_head=$(git log -1 --format='%(trailers:key=Starter-Kit-Source,valueonly)' | tr -d '[:space:]')
+              ;;
+            *) echo "Unsupported Starter Kit channel for ${{ github.ref_name }}" >&2; exit 1 ;;
+          esac
+          if [[ -z "${starter_head:-}" ]]; then
+            starter_head=$(git ls-remote "https://github.com/$starter_repository.git" "refs/heads/$starter_branch" | awk '{print $1}')
+          fi
+          [[ "$starter_head" =~ ^[0-9a-f]{40}$ ]]
+          jq -n \
+            --arg repository "$starter_repository" \
+            --arg branch "$starter_branch" \
+            --arg sourceCommit "$starter_head" \
+            '{repository: $repository, branch: $branch, sourceCommit: $sourceCommit}' \
+            > starter-kit-source.json
+
       - name: Create deterministic release plan
         run: |
           set -euo pipefail
+          if [[ "${{ steps.restore-plan.outputs.restored }}" == "true" ]]; then
+            output=release-plan.verify.json
+          else
+            output=release-plan.json
+          fi
           node .github/scripts/create-release-plan.mjs \
             --branch "${{ github.ref_name }}" \
             --sequence "${{ github.run_number }}" \
             --source-commit "${{ github.sha }}" \
             --native-build-number "$((310000000 + ${{ github.run_number }}))" \
             --ota-inputs ota-release-inputs.json \
+            --starter-kit-source starter-kit-source.json \
             --require-version-mirrors true \
-            --output release-plan.json
-          cp release-plan.json release-plan.first.json
+            --output "$output"
+          if [[ "$output" == "release-plan.verify.json" ]]; then
+            cmp release-plan.json "$output"
+            exit 0
+          fi
+          cp "$output" release-plan.first.json
           node .github/scripts/create-release-plan.mjs \
             --branch "${{ github.ref_name }}" \
             --sequence "${{ github.run_number }}" \
             --source-commit "${{ github.sha }}" \
             --native-build-number "$((310000000 + ${{ github.run_number }}))" \
             --ota-inputs ota-release-inputs.json \
+            --starter-kit-source starter-kit-source.json \
             --require-version-mirrors true \
             --output release-plan.json
           cmp release-plan.first.json release-plan.json
@@ -179,6 +241,7 @@ jobs:
           echo "release_id=$release_id" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
+        if: steps.restore-plan.outputs.restored != 'true'
         with:
           name: ${{ steps.release.outputs.plan_artifact }}
           path: |
@@ -210,6 +273,39 @@ jobs:
       source_commit: ${{ needs.plan.outputs.source_commit }}
       release_plan_artifact: ${{ needs.plan.outputs.plan_artifact }}
       deployment_environment: ${{ needs.plan.outputs.cloud_environment }}
+      dry_run: ${{ needs.plan.outputs.dry_run == 'true' }}
+    secrets: inherit
+
+  runtime-image:
+    name: Publish canonical Mentra Cloud image
+    needs: plan
+    permissions:
+      actions: read
+      attestations: write
+      contents: read
+      id-token: write
+      packages: write
+    uses: ./.github/workflows/reusable-coordinated-runtime-image.yml
+    with:
+      source_commit: ${{ needs.plan.outputs.source_commit }}
+      release_plan_artifact: ${{ needs.plan.outputs.plan_artifact }}
+      dry_run: ${{ needs.plan.outputs.dry_run == 'true' }}
+    secrets: inherit
+
+  private-deployment:
+    name: Deploy release-matched private stack
+    needs: [plan, runtime-image]
+    if: needs.plan.outputs.cloud_environment == 'dev'
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+      packages: read
+    uses: ./.github/workflows/private-deployment-dev.yml
+    with:
+      source_commit: ${{ needs.plan.outputs.source_commit }}
+      release_plan_artifact: ${{ needs.plan.outputs.plan_artifact }}
+      runtime_image_artifact: ${{ needs.runtime-image.outputs.result_artifact }}
       dry_run: ${{ needs.plan.outputs.dry_run == 'true' }}
     secrets: inherit
 
@@ -310,7 +406,7 @@ jobs:
           repositories: |
             MentraOS
             Mentra-Bluetooth-SDK-Starter-Kit
-          permission-actions: read
+          permission-actions: write
           permission-contents: write
 
       - name: Request the exact Starter Kit release
@@ -341,7 +437,9 @@ jobs:
             *) echo "Unsupported prerelease Starter Kit channel $channel" >&2; exit 1 ;;
           esac
 
-          expected_head=$(gh api "repos/$STARTER_KIT_REPOSITORY/branches/$target_branch" --jq .commit.sha)
+          [[ "$(jq -er .starterKitSource.repository "$plan")" == "$STARTER_KIT_REPOSITORY" ]]
+          [[ "$(jq -er .starterKitSource.branch "$plan")" == "$target_branch" ]]
+          expected_head=$(jq -er .starterKitSource.sourceCommit "$plan")
           payload=$(jq -cn \
             --arg releaseSetId "$release_set_id" \
             --arg releaseIdentity "$identity" \
@@ -378,7 +476,8 @@ jobs:
 
           if ! curl --fail --silent --show-error --location "$result_url" --output /dev/null 2>&1; then
             run_json=$(gh run list --repo "$STARTER_KIT_REPOSITORY" \
-              --workflow coordinated-example-release.yml --event repository_dispatch --limit 100 \
+              --workflow coordinated-example-release.yml --event workflow_dispatch \
+              --branch "$target_branch" --limit 100 \
               --json databaseId,displayTitle,status,url \
               --jq ".[] | select(.displayTitle == \"$run_title\" and .status != \"completed\")" \
               | head -1)
@@ -389,14 +488,11 @@ jobs:
               echo "run_url=$run_url" >> "$GITHUB_OUTPUT"
             else
               dispatched_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-              dispatch=$(jq -cn \
-                --arg channel "$channel" \
-                --arg payload "$payload" \
-                '{
-                  event_type: "coordinated_example_release",
-                  client_payload: {channel: $channel, payload: $payload}
-                }')
-              gh api --method POST "repos/$STARTER_KIT_REPOSITORY/dispatches" --input - <<< "$dispatch"
+              gh workflow run coordinated-example-release.yml \
+                --repo "$STARTER_KIT_REPOSITORY" \
+                --ref "$target_branch" \
+                --field channel="$channel" \
+                --field payload="$payload"
             fi
 
             candidate_branch="coordinated/$identity"
@@ -405,7 +501,8 @@ jobs:
             for _ in {1..180}; do
               if [[ -z "$run_id" ]]; then
                 run_json=$(gh run list --repo "$STARTER_KIT_REPOSITORY" \
-                  --workflow coordinated-example-release.yml --event repository_dispatch --limit 30 \
+                  --workflow coordinated-example-release.yml --event workflow_dispatch \
+                  --branch "$target_branch" --limit 30 \
                   --json databaseId,displayTitle,createdAt,url \
                   --jq ".[] | select(.displayTitle == \"$run_title\" and .createdAt >= \"$dispatched_at\")" \
                   2>/dev/null | head -1 || true)
@@ -455,13 +552,30 @@ jobs:
         env:
           RESULT_NAME: ${{ steps.request.outputs.result_name }}
           RESULT_URL: ${{ steps.request.outputs.result_url }}
+          RUN_URL: ${{ steps.request.outputs.run_url }}
+          # Public run metadata needs no cross-repository permissions. The job
+          # token remains valid through this wait; the request App token expires
+          # after one hour, before the full 105-minute wait can finish.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir -p starter-kit-result
           for _ in {1..630}; do
-            if curl --fail --silent --show-error --location "$RESULT_URL" \
+            if curl --fail --silent --show-error --location --connect-timeout 10 --max-time 30 "$RESULT_URL" \
               --output "starter-kit-result/$RESULT_NAME" 2>/dev/null; then
               exit 0
+            fi
+            if [[ -n "$RUN_URL" ]]; then
+              # A transient API failure must not be mistaken for a failed build.
+              run_state=$(gh api "repos/Mentra-Community/Mentra-Bluetooth-SDK-Starter-Kit/actions/runs/${RUN_URL##*/}" \
+                --jq '{status,conclusion}' 2>/dev/null || true)
+              if [[ "$(jq -r '.status // empty' <<< "${run_state:-null}")" == "completed" ]]; then
+                conclusion=$(jq -r '.conclusion // "unknown"' <<< "$run_state")
+                if [[ "$conclusion" != "success" ]]; then
+                  echo "Starter Kit run concluded $conclusion: $RUN_URL" >&2
+                  exit 1
+                fi
+              fi
             fi
             sleep 10
           done
@@ -603,11 +717,27 @@ jobs:
 
   finalize:
     name: Finalize immutable release bill of materials
-    needs: [plan, cloud-v2, ota, npm, sdk-native, mobile, engine-consumer, starter-kit, example-testflight]
+    needs:
+      [
+        plan,
+        cloud-v2,
+        runtime-image,
+        private-deployment,
+        ota,
+        npm,
+        sdk-native,
+        mobile,
+        engine-consumer,
+        starter-kit,
+        example-testflight,
+      ]
     if: >-
       always() &&
       needs.plan.result == 'success' &&
       needs.cloud-v2.result == 'success' &&
+      needs.runtime-image.result == 'success' &&
+      (needs.private-deployment.result == 'success' ||
+        (needs.plan.outputs.cloud_environment != 'dev' && needs.private-deployment.result == 'skipped')) &&
       needs.ota.result == 'success' &&
       needs.npm.result == 'success' &&
       needs.sdk-native.result == 'success' &&
@@ -636,6 +766,17 @@ jobs:
         with:
           name: ${{ needs.cloud-v2.outputs.result_artifact }}
           path: release-input/cloud-v2
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.runtime-image.outputs.result_artifact }}
+          path: release-input/runtime-image
+
+      - uses: actions/download-artifact@v4
+        if: needs.plan.outputs.cloud_environment == 'dev'
+        with:
+          name: ${{ needs.private-deployment.outputs.result_artifact }}
+          path: release-input/private-deployment
 
       - uses: actions/download-artifact@v4
         with:
@@ -682,6 +823,12 @@ jobs:
           engine_package=$(find release-input/npm -type f -name 'mentra-engine-*.tgz' -print -quit)
           test -n "$engine_package"
           starter_kit_args=()
+          private_deployment_args=()
+          if [[ "${{ needs.plan.outputs.cloud_environment }}" == "dev" ]]; then
+            private_deployment_args=(
+              --private-deployment release-input/private-deployment/private-deployment.json
+            )
+          fi
           if [[ "${{ needs.plan.outputs.dry_run }}" != "true" ]]; then
             starter_kit_result=$(find release-input/starter-kit -type f -name 'starter-kit-release-*.json' -print -quit)
             example_testflight=$(find release-input/example-testflight -type f -name 'example-testflight-publication.json' -print -quit)
@@ -700,6 +847,8 @@ jobs:
             --native release-input/sdk-native/sdk-native-publications.json \
             --mobile release-input/mobile/mobile-publications.json \
             --cloud release-input/cloud-v2/cloud-v2-deployment.json \
+            --runtime-image release-input/runtime-image/runtime-image-publication.json \
+            "${private_deployment_args[@]}" \
             "${starter_kit_args[@]}" \
             --asg-selection "$asg_selection" \
             --engine-package "$engine_package" \
@@ -789,6 +938,10 @@ jobs:
             echo "- Release: \`${{ steps.results.outputs.identity }}\`"
             echo "- Source: \`${{ needs.plan.outputs.source_commit }}\`"
             echo "- Cloud deployment: \`$(jq -er .cloud.deploymentId finalized-release/publication-results.json 2>/dev/null || echo validated-only)\`"
+            echo "- Runtime image: \`$(jq -er '.runtimeImage.reference // "validated-only"' finalized-release/publication-results.json)\`"
+            if [[ "${{ needs.plan.outputs.cloud_environment }}" == "dev" ]]; then
+              echo "- Private deployment Runtime: \`$(jq -er '.privateDeployment.azure.revision // "validated-only"' finalized-release/publication-results.json)\`"
+            fi
             echo "- OTA manifest: ${{ needs.ota.outputs.manifest_url }}"
             echo "- Dry run: \`${{ needs.plan.outputs.dry_run }}\`"
             if [[ "${{ needs.plan.outputs.dry_run }}" != "true" ]]; then
@@ -874,6 +1027,8 @@ jobs:
       - name: Prepare and verify the Cloudflare Pages artifact
         env:
           RELEASE_IDENTITY: ${{ needs.plan.outputs.release_identity }}
+          EXAMPLE_APK_URL: ${{ needs.starter-kit.outputs.react_native_apk_url }}
+          EXAMPLE_IOS_URL: ${{ needs.example-testflight.outputs.install_url }}
         run: |
           set -euo pipefail
           export_dir="$RUNNER_TEMP/mentraos-docs"
@@ -882,15 +1037,20 @@ jobs:
           unzip -q "$RUNNER_TEMP/mentraos-docs.zip" -d "$export_dir"
           cat > "$export_dir/_headers" <<'HEADERS'
           /*
+            Cache-Control: public, max-age=0, must-revalidate
             X-Robots-Tag: noindex
           HEADERS
-          grep -R --fixed-strings --quiet "$RELEASE_IDENTITY" "$export_dir/bluetooth-sdk"
           if grep -R --extended-regexp --ignore-case --quiet '\{\{[a-z0-9_-]+\}\}|%7b%7b[a-z0-9_-]+%7d%7d' "$export_dir/bluetooth-sdk"; then
             echo "Mintlify export contains an unresolved documentation variable." >&2
             exit 1
           fi
-          grep -R --fixed-strings --quiet "${{ needs.starter-kit.outputs.react_native_apk_url }}" "$export_dir/bluetooth-sdk"
-          grep -R --fixed-strings --quiet "${{ needs.example-testflight.outputs.install_url }}" "$export_dir/bluetooth-sdk"
+          node .github/scripts/verify-coordinated-docs.mjs \
+            "$export_dir/bluetooth-sdk/software-update/index.html"
+          # Mintlify's static export does not emit docs.json redirects.
+          cat >> "$export_dir/_redirects" <<'REDIRECTS'
+          /mentra-live/software-update /bluetooth-sdk/software-update/ 301
+          /mentra-live/software-update/ /bluetooth-sdk/software-update/ 301
+          REDIRECTS
 
       - name: Deploy to Cloudflare Pages
         env:
@@ -908,6 +1068,35 @@ jobs:
             --commit-message "Deploy MentraOS docs for $RELEASE_IDENTITY" \
             --commit-dirty=true
 
+      # Purging accelerates propagation; the required live-page check below
+      # determines whether the exact release is available to users.
+      - name: Purge release-sensitive documentation routes
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PAGES_API_TOKEN }}
+          CLOUDFLARE_ZONE_ID: ${{ vars.CLOUDFLARE_ZONE_ID }}
+          DOCS_URL: ${{ steps.target.outputs.docs_url }}
+        run: |
+          set -euo pipefail
+          [[ -n "$CLOUDFLARE_ZONE_ID" ]] || {
+            echo "CLOUDFLARE_ZONE_ID repository variable is required." >&2
+            exit 1
+          }
+          payload="$(jq -nc \
+            --arg canonical "$DOCS_URL/bluetooth-sdk/software-update/" \
+            --arg canonical_no_slash "$DOCS_URL/bluetooth-sdk/software-update" \
+            --arg legacy "$DOCS_URL/mentra-live/software-update/" \
+            --arg legacy_no_slash "$DOCS_URL/mentra-live/software-update" \
+            '{files: [$canonical, $canonical_no_slash, $legacy, $legacy_no_slash]}')"
+          response="$(curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            --header "Content-Type: application/json" \
+            --data "$payload" \
+            "https://api.cloudflare.com/client/v4/zones/$CLOUDFLARE_ZONE_ID/purge_cache")"
+          jq --exit-status '.success == true' <<< "$response" >/dev/null
+
       - name: Verify the published custom domain
         env:
           DOCS_URL: ${{ steps.target.outputs.docs_url }}
@@ -916,30 +1105,49 @@ jobs:
           EXAMPLE_IOS_URL: ${{ needs.example-testflight.outputs.install_url }}
         run: |
           set -euo pipefail
-          page="$DOCS_URL/bluetooth-sdk/software-update/"
+          canonical_page="$DOCS_URL/bluetooth-sdk/software-update/"
+          legacy_page="$DOCS_URL/mentra-live/software-update/"
           body="$RUNNER_TEMP/software-update.html"
           headers="$RUNNER_TEMP/software-update.headers"
-          for _ in {1..18}; do
-            if curl --fail --silent --show-error --location \
+          page_is_current() {
+            local page="$1"
+            curl --fail --silent --show-error --location \
               --dump-header "$headers" --output "$body" "$page" && \
               grep --fixed-strings --quiet "$RELEASE_IDENTITY" "$body" && \
               grep --fixed-strings --quiet "href=\"$EXAMPLE_APK_URL\"" "$body" && \
               grep --fixed-strings --quiet "href=\"$EXAMPLE_IOS_URL\"" "$body" && \
               grep --ignore-case --quiet '^x-robots-tag:.*noindex' "$headers" && \
               ! grep --extended-regexp --ignore-case --quiet \
-                '\{\{[a-z0-9_-]+\}\}|%7b%7b[a-z0-9_-]+%7d%7d' "$body"; then
-              echo "Verified $page for $RELEASE_IDENTITY"
+                '\{\{[a-z0-9_-]+\}\}|%7b%7b[a-z0-9_-]+%7d%7d' "$body"
+          }
+          for _ in {1..18}; do
+            if page_is_current "$canonical_page" && page_is_current "$legacy_page"; then
+              echo "Verified $canonical_page and $legacy_page for $RELEASE_IDENTITY"
               exit 0
             fi
             sleep 10
           done
-          echo "Published docs did not converge to $RELEASE_IDENTITY at $page" >&2
+          echo "Published docs did not converge to $RELEASE_IDENTITY at $canonical_page and $legacy_page" >&2
           exit 1
 
   notify-slack:
     name: Notify release Slack channel
     needs:
-      [plan, cloud-v2, ota, npm, sdk-native, mobile, engine-consumer, starter-kit, example-testflight, finalize, docs]
+      [
+        plan,
+        cloud-v2,
+        runtime-image,
+        private-deployment,
+        ota,
+        npm,
+        sdk-native,
+        mobile,
+        engine-consumer,
+        starter-kit,
+        example-testflight,
+        finalize,
+        docs,
+      ]
     if: always() && github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
@@ -961,6 +1169,8 @@ jobs:
           TESTFLIGHT_GROUP: ${{ needs.plan.outputs.testflight_group }}
           PLAN_RESULT: ${{ needs.plan.result }}
           CLOUD_V2_RESULT: ${{ needs.cloud-v2.result }}
+          RUNTIME_IMAGE_RESULT: ${{ needs.runtime-image.result }}
+          PRIVATE_DEPLOYMENT_RESULT: ${{ needs.private-deployment.result }}
           OTA_RESULT: ${{ needs.ota.result }}
           NPM_RESULT: ${{ needs.npm.result }}
           SDK_NATIVE_RESULT: ${{ needs.sdk-native.result }}

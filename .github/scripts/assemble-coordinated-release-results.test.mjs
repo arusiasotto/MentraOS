@@ -8,6 +8,7 @@ import {fileURLToPath} from "node:url"
 
 import {assembleCoordinatedReleaseResults} from "./assemble-coordinated-release-results.mjs"
 import {cloudRecordForPlan} from "./coordinated-cloud-v2-test-helpers.mjs"
+import {runtimeImageRecordForPlan} from "./coordinated-runtime-image-test-helpers.mjs"
 import {createReleasePlan, finalizeReleaseManifest, loadReleaseFamily} from "./release-family.mjs"
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..")
@@ -17,6 +18,11 @@ const plan = createReleasePlan({
   sequence: 57,
   sourceCommit: "a".repeat(40),
   nativeBuildNumber: 310000057,
+  starterKitSource: {
+    repository: "Mentra-Community/Mentra-Bluetooth-SDK-Starter-Kit",
+    branch: "staging",
+    sourceCommit: "1".repeat(40),
+  },
 })
 const provenanceUrl = "https://github.com/Mentra-Community/MentraOS/actions/runs/123"
 
@@ -60,6 +66,7 @@ test("assembles every product target and finalizes one complete release manifest
     "@mentra/jspolyfill",
     "@mentra/cloud-protocol",
     "@mentra/crust",
+    "@mentra/acs-meeting",
     "@mentra/cloud-client",
     "@mentra/bluetooth-sdk",
     "@mentra/miniapp",
@@ -190,31 +197,40 @@ test("assembles every product target and finalizes one complete release manifest
     provenanceUrl,
     ipa: {size: 123, sha256: "9".repeat(64)},
   }
+  const runtimeImage = runtimeImageRecordForPlan(plan)
 
-  const results = assembleCoordinatedReleaseResults({
-    plan,
-    ota,
-    npmRecords,
-    native,
-    mobile,
-    cloud: cloudRecordForPlan(plan),
-    starterKit,
-    starterKitResultUrl: "https://example.com/starter-kit-result.json",
-    exampleTestflight,
-    asgSelectionFile,
-    enginePackage,
-    releaseAssetBaseUrl: "https://github.com/Mentra-Community/MentraOS/releases/download/mentra-builds-v3.1.0",
-  })
+  const assemble = (starterKitRecord) =>
+    assembleCoordinatedReleaseResults({
+      plan,
+      ota,
+      npmRecords,
+      native,
+      mobile,
+      cloud: cloudRecordForPlan(plan),
+      runtimeImage,
+      starterKit: starterKitRecord,
+      starterKitResultUrl: "https://example.com/starter-kit-result.json",
+      exampleTestflight,
+      asgSelectionFile,
+      enginePackage,
+      releaseAssetBaseUrl: "https://github.com/Mentra-Community/MentraOS/releases/download/mentra-builds-v3.1.0",
+    })
+  const results = assemble(starterKit)
   const manifest = finalizeReleaseManifest({plan, results, completedAt: "2026-08-25T02:00:00.000Z"})
 
-  assert.equal(Object.keys(manifest.publications).length, 8)
+  assert.equal(Object.keys(manifest.publications).length, 9)
   assert.equal(manifest.publications["@mentra/bluetooth-sdk"]["maven-central"].status, "submitted")
   assert.equal(manifest.publications.mentraos["app-store-connect"].status, "published")
   assert.ok(manifest.artifacts.some((artifact) => artifact.coordinate === plan.artifactNames.asgSelection))
   assert.equal(manifest.starterKit.resultUrl, "https://example.com/starter-kit-result.json")
   assert.equal(manifest.starterKit.testflight.build.id, "build-1")
   assert.equal(manifest.cloud.environment, "staging")
+  assert.equal(manifest.runtimeImage.digest, runtimeImage.digest)
   assert.equal(manifest.artifacts.at(-1).coordinate, starterKit.artifacts.at(-1).name)
+
+  const wrongStarterSource = structuredClone(starterKit)
+  wrongStarterSource.starterKit.baseCommit = "9".repeat(40)
+  assert.throws(() => assemble(wrongStarterSource), /Starter Kit result does not match the release plan/)
 
   assert.throws(
     () =>
@@ -225,6 +241,7 @@ test("assembles every product target and finalizes one complete release manifest
         native,
         mobile,
         cloud: cloudRecordForPlan(plan),
+        runtimeImage,
         asgSelectionFile,
         enginePackage,
         releaseAssetBaseUrl: "https://example.com/release",
@@ -241,6 +258,7 @@ test("assembles every product target and finalizes one complete release manifest
         native,
         mobile,
         cloud: cloudRecordForPlan(plan),
+        runtimeImage,
         starterKit: {...starterKit, releaseSetId: "mentra-other"},
         starterKitResultUrl: "https://example.com/starter-kit-result.json",
         exampleTestflight,
@@ -261,6 +279,7 @@ test("assembles every product target and finalizes one complete release manifest
         native,
         mobile,
         cloud: cloudRecordForPlan(plan),
+        runtimeImage,
         asgSelectionFile,
         enginePackage,
         releaseAssetBaseUrl: "https://example.com/release",

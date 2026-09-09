@@ -11,12 +11,14 @@ object DeviceTypes {
     const val G2 = "Even Realities G2"
     const val NIMO = "NIMO"
     const val AR99 = "AR99"
-    val ALL = arrayOf(SIMULATED, G1, G2, MACH1, LIVE, Z100, FRAME, NEX, NIMO, AR99)
+    const val S3_WATCH = "ESP32-S3 Watch"
+    val ALL = arrayOf(SIMULATED, G1, G2, MACH1, LIVE, Z100, FRAME, NEX, NIMO, AR99, S3_WATCH)
 }
 
 object ControllerTypes {
     const val R1 = "Even Realities R1"
-    val ALL = arrayOf(R1)
+    const val KEYFOB = "XIAO Keyfob"
+    val ALL = arrayOf(R1, KEYFOB)
 }
 
 object ConnTypes {

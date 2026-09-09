@@ -1,6 +1,7 @@
 import {waitFor} from "@testing-library/react-native"
 import {router} from "expo-router"
 
+import {initI18n} from "@/i18n"
 import mantle from "@/services/MantleManager"
 import {
   audioPlaybackService,
@@ -82,6 +83,7 @@ jest.mock("expo-location", () => ({
   },
   stopLocationUpdatesAsync: jest.fn(() => Promise.resolve()),
   startLocationUpdatesAsync: jest.fn(() => Promise.resolve()),
+  hasStartedLocationUpdatesAsync: jest.fn(() => Promise.resolve(false)),
   getCurrentPositionAsync: jest.fn(() =>
     Promise.resolve({
       coords: {latitude: 1, longitude: 2, accuracy: 3},
@@ -108,6 +110,9 @@ let syncGlassesPresentationState: (status: {state: string}) => void
 
 describe("MantleManager", () => {
   beforeAll(async () => {
+    // Alerts surface translated copy (e.g. the Wi-Fi-needs-glasses blocker), so
+    // initialize i18n before init(); otherwise translate() returns raw keys.
+    await initI18n()
     routerPushSpy = jest.spyOn(router, "push").mockImplementation(() => {})
     jest.useFakeTimers()
     resetBluetoothSdkMock()
@@ -377,6 +382,33 @@ describe("MantleManager", () => {
     await Promise.resolve()
   })
 
+  it("presents notifications on the S3 watch even when Notify is not running", () => {
+    ;(engine.glasses.info as jest.Mock).mockReturnValue({model: "ESP32-S3 Watch"})
+
+    emitCrustEvent("phone_notification", {
+      notificationId: "n-watch",
+      app: "Messages",
+      title: "Hello",
+      content: "On the wrist",
+      priority: 0,
+      timestamp: "12345",
+      packageName: "com.google.android.apps.messaging",
+    })
+
+    expect(localDisplayManager.request).toHaveBeenCalledWith(
+      "cloud.augmentos.notify",
+      expect.objectContaining({
+        durationMs: 15_000,
+        layout: expect.objectContaining({
+          layoutType: "reference_card",
+          title: "Messages: Hello",
+          text: "On the wrist",
+        }),
+      }),
+    )
+    ;(engine.glasses.info as jest.Mock).mockReturnValue({})
+  })
+
   it("forwards notifications without presenting them when Notify is not running", () => {
     const forwardEvent = jest.spyOn(localMiniappRuntime, "forwardEvent")
 
@@ -513,7 +545,28 @@ describe("MantleManager", () => {
     expect(useGlassesStore.getState().otaInProgress).toBe(false)
   })
 
+  it("refuses Wi-Fi setup while the glasses are off Bluetooth and says why", async () => {
+    ;(engine.glasses.status as jest.Mock).mockReturnValue({state: "disconnected"})
+
+    const request = requestWifiSetup("Streaming needs Wi-Fi", "com.mentra.call")
+    const [title, message, buttons] = mockShowAlert.mock.calls.at(-1)!
+
+    expect(title).toBe("Reconnect your glasses")
+    expect(message).toBe(
+      "Wi-Fi setup needs your glasses connected over Bluetooth. Turn them on and wait for them to reconnect, then try again.",
+    )
+    expect(buttons).toHaveLength(1)
+    expect(buttons[0].text).toBe("OK")
+    buttons[0].onPress()
+    await request
+
+    // The miniapp stays in the foreground and no Wi-Fi route is pushed.
+    expect(engine.miniapps.clearForeground).not.toHaveBeenCalled()
+    expect(routerPushSpy).not.toHaveBeenCalled()
+  })
+
   it("prompts before opening Wi-Fi setup and backgrounds the requesting miniapp", async () => {
+    ;(engine.glasses.status as jest.Mock).mockReturnValue({state: "connected"})
     const cancelRequest = requestWifiSetup("Streaming needs Wi-Fi")
     const [, message, cancelButtons] = mockShowAlert.mock.calls.at(-1)!
 

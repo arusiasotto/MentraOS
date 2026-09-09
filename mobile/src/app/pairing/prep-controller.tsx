@@ -254,10 +254,30 @@ export default function PairingPrepScreen() {
     )
   }
 
+  const KeyfobPairingGuide = () => {
+    return (
+      <ScrollView className="flex-1 mt-6" contentContainerStyle={{paddingBottom: 24}} showsVerticalScrollIndicator>
+        <View className="flex-col items-center justify-center bg-primary-foreground rounded-xl mb-6 py-4">
+          <Image
+            source={require("../../../assets/glasses/xiao_keyfob.png")}
+            resizeMode="contain"
+            className="w-50 h-25"
+          />
+        </View>
+        <Text tx="pairing:instructions" className="text-2xl font-bold mb-4 text-secondary-foreground" />
+        <Text className="text-lg text-secondary-foreground mb-2" tx="pairingGuides:KEYFOB.disclaimer" />
+        <Text className="text-lg text-secondary-foreground mb-2" tx="pairingGuides:KEYFOB.step1" />
+        <Text className="text-lg text-secondary-foreground mb-2" tx="pairingGuides:KEYFOB.step2" />
+      </ScrollView>
+    )
+  }
+
   const renderGuide = () => {
     switch (deviceModel) {
       case ControllerTypes.R1:
         return <R1PairingGuide />
+      case ControllerTypes.KEYFOB:
+        return <KeyfobPairingGuide />
     }
 
     throw new Error(`Unknown model name: ${deviceModel}`)

@@ -54,6 +54,7 @@ export { Z100_PROFILE, Z100_HYPHEN_WIDTH_PX, Z100_SPACE_WIDTH_PX } from "./profi
 
 // Mentra Nex Profile (a.k.a. Mentra Display)
 export { NEX_PROFILE, NEX_HYPHEN_WIDTH_PX, NEX_SPACE_WIDTH_PX } from "./profiles";
+export { S3_WATCH_PROFILE, S3_WATCH_HYPHEN_WIDTH_PX, S3_WATCH_SPACE_WIDTH_PX } from "./profiles";
 
 // Import for factory functions
 import { G1_PROFILE_LEGACY, G2_PROFILE, Z100_PROFILE, NEX_PROFILE } from "./profiles";

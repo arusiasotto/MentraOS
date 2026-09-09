@@ -1,0 +1,47 @@
+# ESP32-S3 Watch firmware (MentraOS fork)
+
+Unofficial community firmware for the Waveshare **ESP32-S3-Touch-AMOLED-2.06**
+board, advertised to the Mentra Android app as `ESP32-S3 Watch`.
+
+**This is not a Waveshare product.** It is not affiliated with, endorsed by, or
+supported by Waveshare Electronics. Use at your own risk.
+
+The tested phone driver is
+`mobile/modules/bluetooth-sdk/android/.../sgcs/S3Watch.kt`.
+UUIDs and opcodes live in [`settings.h`](settings.h) and
+`S3WatchProtocol.kt` / `S3WatchProtocol.swift` — keep them identical.
+
+**iOS is untested alpha.** `S3Watch.swift` and `S3WatchProtocol.swift` have
+never been compiled or run on a Mac / iPhone. Do not treat iOS pairing as
+supported.
+
+## Identity
+
+- BLE name prefix: `S3Watch` (MAC suffix appended when `DEVICE_ID` is empty)
+- GATT service `c3a1b410-…d010`: control write, event notify, JPEG write, mic notify
+
+## Flash
+
+```bash
+cd firmware/s3-watch
+pio run -t upload
+pio device monitor
+```
+
+Board package: ESP32-S3 with OPI PSRAM. If your Waveshare kit uses 32 MB flash,
+set `board_upload.flash_size = 32MB` in `platformio.ini`.
+
+Wearer controls and features: [`CONTROLS.md`](CONTROLS.md).
+
+## v1 features
+
+- Full-screen UTF-8 text
+- Full-screen JPEG blit (410x502)
+- Brightness
+- 16 kHz 16-bit mono PCM mic (ES7210 + I2S) when the phone sends `MIC_ENABLE`
+- Capacitive gestures (FT3168): swipe up/down, tap, double tap, long press
+- Display sleeps after 30s idle. The S3 then light-sleeps with BLE still up so Mentra stays connected and can push notification JPEGs. Wake on tap, PWR, BOOT, or a GATT write. Mic / in-flight JPEG keep it awake.
+- Short PWR tap: G2-style app menu (swipe to move, tap to toggle). Hold PWR ~1s to sleep. Hardware still offs at ~6s.
+- Top BOOT button: wake, or dismiss the menu / a HUD card back to the watch face. Hold ~0.7s to cycle HUD color (green / amber / red / white / cyan). Hold BOOT at power-on still enters download.
+- AXP2101 battery percent on the watch face and via BLE (`0%` when no cell is present)
+- Short speaker beep when a JPEG card replaces the idle face (notifications; not Captions frames)
