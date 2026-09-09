@@ -329,6 +329,38 @@ const ledAck = await BluetoothSdk.rgbLedControl(
 console.log(ledAck.state)
 ```
 
+## Dashboard Content
+
+`setDashboardContent(content)` keeps the standard `$TIME12$ $DATE$ $GBATT$
+$CONNECTION_STATUS$` status header and places non-empty content below it after a
+blank line. Pass the exact empty string to reset the dashboard to the status
+header only. The template is held in memory for the SDK process/session, and its
+status placeholders are refreshed each time the dashboard renders. Calling this
+method does not open the dashboard; it updates an active contextual dashboard
+immediately or appears on the next head-up. Repeating the same content is a
+no-op.
+
+React Native / Expo:
+
+```ts
+await BluetoothSdk.setDashboardContent('Next meeting at 2 PM')
+await BluetoothSdk.setDashboardContent('')
+```
+
+Kotlin:
+
+```kotlin
+sdk.setDashboardContent("Next meeting at 2 PM")
+sdk.setDashboardContent("")
+```
+
+Swift (iOS and macOS):
+
+```swift
+await sdk.setDashboardContent("Next meeting at 2 PM")
+await sdk.setDashboardContent("")
+```
+
 Settings commands that return `SettingsAckSuccessEvent` reject when the ASG reports an error ack. The SDK updates its local settings store only after that ASG ack resolves successfully, so observed SDK state reflects the acknowledged glasses state rather than a queued request. Raw `settings_ack` listener events still use `SettingsAckEvent` because they can include both success and failure statuses. `rgbLedControl(...)` resolves from a successful ASG `rgb_led_control_response` and rejects when the ASG reports `state: "error"`; raw `settings_ack` and `rgb_led_control_response` events remain available through listeners.
 
 WiFi, hotspot, and version-info commands resolve from the ASG response path, not local dispatch:
@@ -345,7 +377,7 @@ React Native narrows returned values to success shapes where the raw listener ev
 | `stopVideoRecording(...)` | `VideoRecordingStoppedStatusEvent` with `success: true` and `status: "recording_stopped"`. When a webhook URL is supplied, resolves after the video upload succeeds. | Rejects on `success: false` statuses such as `not_recording`, webhook upload failure, send failure, or timeout. |
 | `queryVideoRecordingStatus(requestId)` | `VideoRecordingStatusEvent` with the current `recording` state and elapsed `duration_ms` when available. | Rejects when disconnected, another video command uses the same request ID, or the response times out. |
 | `rgbLedControl(...)` | `RgbLedControlSuccessResponseEvent` with `state: "success"`. | Rejects when raw `rgb_led_control_response.state === "error"` or the response times out. |
-| `checkForOtaUpdate()` | `boolean`, true when the configured OTA manifest has an ASG APK, MTK, or BES update for the connected glasses; false only when the manifest was checked successfully and no update is available. | Rejects when the glasses are disconnected, version info is unavailable, the manifest cannot be fetched, or the manifest response is invalid/missing required ASG app version fields. |
+| `checkForOtaUpdate()` | `boolean`, true when the configured OTA manifest has an ASG APK, MTK, or BES update for the connected glasses; false only when the manifest was checked successfully and no update is available. | Rejects when the glasses are disconnected, version info is unavailable, the glasses report an unofficial client package (`unofficial_client`), the manifest cannot be fetched, or the manifest response is invalid/missing required ASG app version fields. |
 
 Android and iOS async APIs use `BluetoothSdkException` / `BluetoothSdkError` for the same error paths. Their returned event structs are the successful response in normal `try`/`await` code, while raw listener/delegate events still include both success and error payloads.
 
