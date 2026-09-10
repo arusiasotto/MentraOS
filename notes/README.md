@@ -42,3 +42,9 @@ Any plan that will span multiple chat sessions should be saved as a file under `
 ## Other content under `notes/`
 
 Architecture notes, bluetooth-sdk subsystem docs, OTA specs, and related material also live under `notes/` (and under `agents/` for agent scratchpads). Use the superpowers layout above for **new** multi-session implementation plans.
+
+## Failed / archived controller paths
+
+Do not reopen these unless the hardware itself changes:
+
+- **Colmi R12** — failed. GATT input is a single generic tap at ~1 Hz, with no swipe and no hold. Spec: [superpowers/specs/2026-08-31-colmi-r12-controller-feasibility.md](superpowers/specs/2026-08-31-colmi-r12-controller-feasibility.md). Cancelled plan: [superpowers/plans/archive/2026-08-31-colmi-r12-controller.md](superpowers/plans/archive/2026-08-31-colmi-r12-controller.md).
