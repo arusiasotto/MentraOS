@@ -16,6 +16,7 @@ import com.mentra.asg_client.camera.CameraNeoService;
 import com.mentra.asg_client.camera.feedback.PhotoFeedbackController;
 import com.mentra.asg_client.camera.feedback.PhotoLightController;
 import com.mentra.asg_client.camera.lifecycle.PhotoExifMetadataWriter;
+import com.mentra.asg_client.camera.lifecycle.VideoRecordingSession;
 import com.mentra.asg_client.camera.model.CameraOperationError;
 import com.mentra.asg_client.camera.model.CapturedPhoto;
 import com.mentra.asg_client.camera.model.PhotoCaptureSettings;
@@ -104,8 +105,8 @@ public class MediaCaptureService {
     // captureId key, while written on the start/callback threads — needs cross-thread visibility.
     private volatile String currentVideoPath = null;
     private long recordingStartTime = 0;
-    private boolean currentVideoLedEnabled =
-            false; // Track if LED was enabled for current recording
+    private final Object mVideoPrivacyLightLock = new Object();
+    @Nullable private Object currentVideoPrivacyLightOwner;
     private boolean currentVideoSoundEnabled =
             false; // Track if sound was enabled for current recording
 
@@ -234,6 +235,10 @@ public class MediaCaptureService {
             this.targetHeight = targetHeight;
             this.avifQuality = avifQuality;
         }
+    }
+
+    private int resolveBleJpegQuality(String requestId) {
+      return photoRequestedCompression.getOrDefault(requestId, PhotoCompression.NONE).jpegQuality;
     }
 
     private BleParams resolveBleParams(String requestedSize) {
@@ -604,6 +609,87 @@ public class MediaCaptureService {
     private Map<String, String> photoRequestedSizes = new HashMap<>();
     // Track capture mode through asynchronous WiFi-to-BLE fallback.
     private Map<String, String> photoRequestedModes = new HashMap<>();
+    private final Map<String, PhotoCompression> photoRequestedCompression = new ConcurrentHashMap<>();
+    private final Map<String, String> photoThumbnailIds = new ConcurrentHashMap<>();
+    private final Map<String, java.util.concurrent.CompletableFuture<Boolean>> thumbnailAcks =
+            new ConcurrentHashMap<>();
+
+    /** Enable a preview for this request only; the ordinary full-photo route is unchanged. */
+    public void requestThumbnail(String requestId, String bleImgId) {
+        photoThumbnailIds.put(requestId, "T" + bleImgId.substring(1));
+    }
+
+    /** Runs on the photo worker, never on the command thread that receives the acknowledgement. */
+    private void presendThumbnail(android.graphics.Bitmap source, String requestId, int orientation)
+            throws Exception {
+        try (ThumbnailTransfer transfer = startThumbnail(source, requestId, orientation)) {
+            if (transfer != null) transfer.await();
+        }
+    }
+
+    private final class ThumbnailTransfer implements AutoCloseable {
+        final String id;
+        final java.util.concurrent.CompletableFuture<Boolean> ack;
+        final PhotoTransferAck completion;
+
+        ThumbnailTransfer(String id) {
+            this.id = id;
+            completion = new PhotoTransferAck(AsgConstants.PHOTO_THUMBNAIL_TIMEOUT_SECONDS * 1000L);
+            ack = new java.util.concurrent.CompletableFuture<>();
+            ack.whenComplete(
+                    (success, error) -> {
+                        if (error != null) {
+                            completion.result.completeExceptionally(error);
+                            return;
+                        }
+                        completion.result.complete(success);
+                    });
+            thumbnailAcks.put(id, ack);
+        }
+
+        void await() throws Exception {
+            completion.await();
+        }
+
+        @Override
+        public void close() {
+            thumbnailAcks.remove(id, ack);
+            ack.cancel(false);
+            completion.result.cancel(false);
+        }
+    }
+
+    /** Starts the transfer without blocking the photo worker on the phone acknowledgement. */
+    private ThumbnailTransfer startThumbnail(
+            android.graphics.Bitmap source, String requestId, int orientation) throws Exception {
+        String thumbnailId = photoThumbnailIds.remove(requestId);
+        if (thumbnailId == null) return null;
+        long started = android.os.SystemClock.elapsedRealtime();
+        byte[] bytes = PhotoThumbnail.encode(source, orientation);
+        long encodeMs = android.os.SystemClock.elapsedRealtime() - started;
+        ThumbnailTransfer transfer = new ThumbnailTransfer(thumbnailId);
+        try {
+            JSONObject ready = new JSONObject();
+            ready.put("type", "ble_photo_ready");
+            ready.put("requestId", requestId);
+            ready.put("bleImgId", thumbnailId);
+            ready.put("thumbnail", true);
+            ready.put("compressionDurationMs", encodeMs);
+
+            // Use the existing ordered prelude + binary file transport, including retries.
+            if (mServiceCallback == null
+                    || !mServiceCallback.sendFileViaBluetooth(
+                            bytes,
+                            thumbnailId,
+                            ready.toString().getBytes(java.nio.charset.StandardCharsets.UTF_8))) {
+                throw new java.io.IOException("Thumbnail BLE transfer could not start");
+            }
+            return transfer;
+        } catch (Exception e) {
+            transfer.close();
+            throw e;
+        }
+    }
 
     private String finalPhotoPath(String requestId, String fallbackPath) {
         String path = photoOriginalPaths.get(requestId);
@@ -634,6 +720,8 @@ public class MediaCaptureService {
         photoTextCropApplied.remove(requestId);
         photoRequestedSizes.remove(requestId);
         photoRequestedModes.remove(requestId);
+        photoRequestedCompression.remove(requestId);
+        photoThumbnailIds.remove(requestId);
     }
 
     /** Clear all request state, including timing data, on a terminal non-BLE exit. */
@@ -711,7 +799,6 @@ public class MediaCaptureService {
     // Safety timeout covers the full job (capture + upload/BLE-handoff). Sized to outlast a
     // slow webhook upload on flaky WiFi so we don't prematurely free the flag while the upload
     // is still grinding. Force-resets isPhotoJobInFlight if no terminal callback fires.
-    private static final long CAPTURE_SAFETY_TIMEOUT_MS = 45000; // 45 seconds
     private final Object captureSafetyTimeoutLock = new Object();
     private Runnable captureSafetyTimeout;
     private String captureSafetyTimeoutRequestId;
@@ -881,26 +968,18 @@ public class MediaCaptureService {
             @Nullable PhotoCaptureSettings captureSettings) {
         boolean cameraWarm =
                 CameraNeoService.isCameraWarm(size, isFromSdk, exposureTimeNs, captureSettings);
-        return photoFeedbackController.start(requestId, cameraWarm);
-    }
-
-    /** Flash privacy LED synchronized with shutter sound for photo capture */
-    private void flashPrivacyLedForPhoto() {
-        if (hardwareManager == null) {
-            Log.w(TAG, "⚠️ hardwareManager is null, cannot flash privacy LED");
-            return;
-        }
-
-        if (!hardwareManager.supportsRecordingLed()) {
-            Log.w(TAG, "⚠️ Privacy LED not supported on this device");
-            return;
-        }
-
-        Log.d(TAG, "📸 Flashing privacy LED synchronized with shutter sound at 50% brightness");
-        // TODO: RESTORE LOWER LED BRIGHTNESS LATER
-        // hardwareManager.setRecordingLedBrightness(50, 1000); // 50% brightness, 1000ms flash
-        // duration
-        hardwareManager.flashRecordingLed(1000);
+        // Warm says "no cold ISP start, so no hold-still cue". Ready says "this capture should
+        // start now rather than queueing", the stricter fact the request-time shutter needs.
+        //
+        // Both are predictions, not guarantees: each takes SERVICE_LOCK on its own, and the LED
+        // work below runs before enqueuePhotoRequest() takes it again, so another request can
+        // start a capture in between and leave shutterNow stale-true. Closing that would mean
+        // deciding the feedback inside the same lock acquisition the enqueue uses, which is a
+        // wider change to this boundary than the audio fix warrants. The residual case degrades
+        // to the old behaviour — a snap slightly ahead of its frame — rather than a wrong or
+        // missing sound, and the common rapid-press case it does catch is the one users hit.
+        boolean shutterNow = cameraWarm && CameraNeoService.isCameraReadyForImmediateCapture();
+        return photoFeedbackController.start(requestId, cameraWarm, shutterNow);
     }
 
     /** Trigger solid white LED for video recording duration (default brightness) */
@@ -984,8 +1063,7 @@ public class MediaCaptureService {
         // Check if battery is too low to start recording (query current level for accuracy)
         if (mStateManager != null) {
             int currentBatteryLevel = mStateManager.getBatteryLevel();
-            if (currentBatteryLevel >= 0
-                    && currentBatteryLevel < BatteryConstants.MIN_BATTERY_LEVEL) {
+            if (BatteryConstants.isCameraBatteryLow(currentBatteryLevel, hardwareManager)) {
                 Log.w(
                         TAG,
                         "🚫 Battery too low to start recording: "
@@ -1217,6 +1295,21 @@ public class MediaCaptureService {
             boolean enableSound,
             int maxRecordingTimeMinutes,
             boolean save) {
+        // Both button and command starts arrive here after recorder teardown.
+        // Queue admission cannot authorize a later capture using expired evidence.
+        int batteryLevel = mStateManager != null ? mStateManager.getBatteryLevel() : -1;
+        if (BatteryConstants.isCameraBatteryLow(batteryLevel, hardwareManager)) {
+            VideoRecordingSession.deleteCorruptCapture(videoFilePath);
+            videoRecordingLifecycle.startFailed();
+            playBatteryLowSound();
+            if (mMediaCaptureListener != null) {
+                mMediaCaptureListener.onMediaError(
+                        requestId, "Battery too low for video capture",
+                        MediaUploadQueueManager.MEDIA_TYPE_VIDEO);
+            }
+            return;
+        }
+
         // Check if any streaming is active - videos cannot interrupt streams
         if (RtmpStreamingService.isStreaming()
                 || SrtStreamingService.isStreaming()
@@ -1262,8 +1355,11 @@ public class MediaCaptureService {
         // Save info for the current recording session
         currentVideoId = requestId;
         currentVideoPath = videoFilePath;
-        currentVideoLedEnabled = enableFlash; // Track LED state for this recording
         currentVideoSoundEnabled = enableSound; // Track sound state for this recording
+        final Object videoPrivacyLightOwner = enableFlash ? new Object() : null;
+        synchronized (mVideoPrivacyLightLock) {
+            currentVideoPrivacyLightOwner = videoPrivacyLightOwner;
+        }
         final String captureIdAtStart = captureIdFromVideoAbsPath(videoFilePath);
         if (captureIdAtStart != null) {
             videoCaptureIdsInFlight.add(captureIdAtStart);
@@ -1293,21 +1389,34 @@ public class MediaCaptureService {
                             isRecordingVideo = true;
                             recordingStartTime = System.currentTimeMillis();
 
+                            // cleanup() can race this background callback after the camera service
+                            // has already started. A recording that cannot enter this service's
+                            // active lifecycle must be stopped, not merely denied LED ownership.
+                            if (isCleaningUp.get()) {
+                                Log.w(TAG, "Stopping video that started during cleanup");
+                                stopVideoRecording(StopReason.ERROR);
+                                return;
+                            }
+
                             // Start battery monitoring on main thread (callback runs on background
                             // thread)
                             new Handler(Looper.getMainLooper())
                                     .post(() -> startBatteryMonitoring());
 
                             // Turn on recording flash LED if enabled with controlled brightness
-                            if (enableFlash && hardwareManager.supportsLedBrightness()) {
+                            if (videoPrivacyLightOwner != null
+                                    && hardwareManager.supportsLedBrightness()) {
                                 // TODO: RESTORE LOWER LED BRIGHTNESS LATER
                                 // hardwareManager.setRecordingLedBrightness(50); // 50% brightness
                                 // for video
-                                hardwareManager.setRecordingLedOn();
-                                Log.d(TAG, "Recording flash LED turned ON at 50% brightness");
-                            } else if (enableFlash && hardwareManager.supportsRecordingLed()) {
-                                hardwareManager.setRecordingLedOn();
-                                Log.d(TAG, "Recording flash LED turned ON (full brightness)");
+                                if (acquireVideoPrivacyLight(videoPrivacyLightOwner)) {
+                                    Log.d(TAG, "Recording flash LED turned ON at 50% brightness");
+                                }
+                            } else if (videoPrivacyLightOwner != null
+                                    && hardwareManager.supportsRecordingLed()) {
+                                if (acquireVideoPrivacyLight(videoPrivacyLightOwner)) {
+                                    Log.d(TAG, "Recording flash LED turned ON (full brightness)");
+                                }
                             }
 
                             // Notify listener
@@ -1376,8 +1485,8 @@ public class MediaCaptureService {
                             // synchronized with sound
 
                             // Turn off recording LED if it was enabled
-                            if (enableFlash && hardwareManager.supportsRecordingLed()) {
-                                hardwareManager.setRecordingLedOff();
+                            if (videoPrivacyLightOwner != null) {
+                                releaseVideoPrivacyLight(videoPrivacyLightOwner);
                                 Log.d(TAG, "Recording LED turned OFF");
                             }
 
@@ -1624,8 +1733,8 @@ public class MediaCaptureService {
                             stopVideoRecordingLed();
 
                             // Turn off recording LED on error if it was enabled
-                            if (enableFlash && hardwareManager.supportsRecordingLed()) {
-                                hardwareManager.setRecordingLedOff();
+                            if (videoPrivacyLightOwner != null) {
+                                releaseVideoPrivacyLight(videoPrivacyLightOwner);
                                 Log.d(TAG, "Recording LED turned OFF (due to error)");
                             }
 
@@ -1661,6 +1770,7 @@ public class MediaCaptureService {
 
             // Turn off RGB white LED if error occurred during start
             stopVideoRecordingLed();
+            releaseVideoPrivacyLight(videoPrivacyLightOwner);
 
             if (mMediaCaptureListener != null) {
                 mMediaCaptureListener.onMediaError(
@@ -1835,12 +1945,38 @@ public class MediaCaptureService {
                 uploadTargetsByCaptureId.remove(captureId);
             }
 
-            // Ensure LED is turned off even if stop fails (if it was enabled)
-            if (currentVideoLedEnabled && hardwareManager.supportsRecordingLed()) {
-                hardwareManager.setRecordingLedOff();
+            // Ensure the privacy light is released even if stop dispatch fails.
+            final Object videoPrivacyLightOwner;
+            synchronized (mVideoPrivacyLightLock) {
+                videoPrivacyLightOwner = currentVideoPrivacyLightOwner;
+            }
+            if (videoPrivacyLightOwner != null) {
+                releaseVideoPrivacyLight(videoPrivacyLightOwner);
                 Log.d(TAG, "Recording LED turned OFF (stop error recovery)");
             }
             completeVideoTermination();
+        }
+    }
+
+    private boolean acquireVideoPrivacyLight(Object owner) {
+        synchronized (mVideoPrivacyLightLock) {
+            if (isCleaningUp.get() || currentVideoPrivacyLightOwner != owner) {
+                return false;
+            }
+            hardwareManager.acquireRecordingLed(owner);
+            return true;
+        }
+    }
+
+    private void releaseVideoPrivacyLight(Object owner) {
+        if (owner == null) {
+            return;
+        }
+        synchronized (mVideoPrivacyLightLock) {
+            if (currentVideoPrivacyLightOwner == owner) {
+                currentVideoPrivacyLightOwner = null;
+            }
+            hardwareManager.releaseRecordingLed(owner);
         }
     }
 
@@ -1976,7 +2112,7 @@ public class MediaCaptureService {
         // BATTERY CHECK: Reject if battery too low
         if (mStateManager != null) {
             int batteryLevel = mStateManager.getBatteryLevel();
-            if (batteryLevel >= 0 && batteryLevel < BatteryConstants.MIN_BATTERY_LEVEL) {
+            if (BatteryConstants.isCameraBatteryLow(batteryLevel, hardwareManager)) {
                 Log.w(TAG, "🚫 Photo rejected - battery too low (" + batteryLevel + "%)");
                 playBatteryLowSound();
                 if (mMediaCaptureListener != null) {
@@ -2079,7 +2215,7 @@ public class MediaCaptureService {
         // Skip sound and flash during camera HAL restart cooldown (e.g. after FOV change)
         boolean suppressPhotoFeedback = shouldSuppressPhotoFeedback();
         final PhotoLightController.Token captureLightToken =
-                photoLightController.prepare(!suppressPhotoFeedback);
+                photoLightController.prepare(requestId, !suppressPhotoFeedback);
         PhotoFeedbackController.Token feedbackToken = null;
         if (!suppressPhotoFeedback) {
             if (effectiveSound) {
@@ -2088,14 +2224,12 @@ public class MediaCaptureService {
                 feedbackToken =
                         startPhotoFeedback(requestId, size, false, null, captureSettings);
             }
-            if (enableFlash) {
-                flashPrivacyLedForPhoto(); // Flash privacy LED
-            }
         }
         final PhotoFeedbackController.Token captureFeedbackToken = feedbackToken;
 
         // TESTING: Check for fake camera capture failure
         if (PhotoCaptureTestHooks.shouldFail("CAMERA_CAPTURE")) {
+            photoLightController.finish(captureLightToken);
             photoFeedbackController.stopForFailure(captureFeedbackToken);
             Log.e(TAG, "TESTING: Simulating camera capture failure");
             sendPhotoErrorResponse(
@@ -2198,8 +2332,7 @@ public class MediaCaptureService {
                                 null,
                                 captureMetadata);
 
-                        // LED is now managed by CameraNeoService and will turn off when camera
-                        // closes
+                        // PhotoSession owns the privacy LED through final JPEG arrival.
 
                         // Notify through standard capture listener if set up
                         if (mMediaCaptureListener != null) {
@@ -2213,6 +2346,7 @@ public class MediaCaptureService {
 
                     @Override
                     public void onPhotoFailureDetected() {
+                        photoLightController.finish(captureLightToken);
                         photoFeedbackController.stopForFailure(captureFeedbackToken);
                     }
 
@@ -2223,12 +2357,12 @@ public class MediaCaptureService {
 
                     @Override
                     public void onPhotoError(CameraOperationError error) {
+                        photoLightController.finish(captureLightToken);
                         photoFeedbackController.stopForFailure(captureFeedbackToken);
                         Log.e(TAG, "Failed to capture offline photo: " + error.message());
                         sendPhotoStatus(requestId, "failed", null, error.code(), error.message());
 
-                        // LED is now managed by CameraNeoService and will turn off when camera
-                        // closes
+                        // PhotoSession owns the privacy LED through final JPEG arrival.
 
                         if (mMediaCaptureListener != null) {
                             mMediaCaptureListener.onMediaError(
@@ -2239,6 +2373,7 @@ public class MediaCaptureService {
                     }
                 });
         } catch (Exception e) {
+            photoLightController.finish(captureLightToken);
             photoFeedbackController.stopForFailure(captureFeedbackToken);
             Log.e(TAG, "Failed to enqueue button photo", e);
             sendPhotoStatus(
@@ -2336,7 +2471,7 @@ public class MediaCaptureService {
 
         boolean suppressPhotoFeedback = shouldSuppressPhotoFeedback();
         final PhotoLightController.Token captureLightToken =
-                photoLightController.prepare(!suppressPhotoFeedback);
+                photoLightController.prepare(requestId, !suppressPhotoFeedback);
         PhotoFeedbackController.Token feedbackToken = null;
         if (!suppressPhotoFeedback) {
             if (enableSound) {
@@ -2348,9 +2483,6 @@ public class MediaCaptureService {
                                 true,
                                 exposureTimeNs,
                                 captureSettings);
-            }
-            if (enableFlash) {
-                flashPrivacyLedForPhoto();
             }
         }
         final PhotoFeedbackController.Token captureFeedbackToken = feedbackToken;
@@ -2506,6 +2638,7 @@ public class MediaCaptureService {
 
                         @Override
                         public void onPhotoFailureDetected() {
+                            photoLightController.finish(captureLightToken);
                             photoFeedbackController.stopForFailure(captureFeedbackToken);
                         }
 
@@ -2516,6 +2649,7 @@ public class MediaCaptureService {
 
                         @Override
                         public void onPhotoError(CameraOperationError error) {
+                            photoLightController.finish(captureLightToken);
                             photoFeedbackController.stopForFailure(captureFeedbackToken);
                             try {
                                 Log.e(
@@ -2539,6 +2673,7 @@ public class MediaCaptureService {
                     });
             return true;
         } catch (Exception e) {
+            photoLightController.finish(captureLightToken);
             photoFeedbackController.stopForFailure(captureFeedbackToken);
             try {
                 Log.e(TAG, "Error taking local-save photo", e);
@@ -2602,6 +2737,329 @@ public class MediaCaptureService {
     }
 
     /**
+     * Full-size still during a WHIP call on the glasses hotspot, without ending the stream.
+     *
+     * <p>The live capturer lends Camera2 to this shot while substitute frames keep the WebRTC track
+     * flowing; the camera goes back to the stream as soon as the JPEG is in memory, before the
+     * upload. The JPEG is POSTed as {@code image/jpeg} to the phone's local {@code /photo/<id>}
+     * endpoint over the hotspot, unmodified (EXIF orientation preserved), and never touches
+     * storage. Terminal result is the usual {@code photo_response}, with {@code streamPhoto},
+     * {@code bytes} and per-phase timings on success.
+     *
+     * @param photoFilePath transient path CameraNeo may use; nothing is persisted there
+     * @param uploadUrl phone endpoint, already checked by {@link StreamPhotoTarget}
+     */
+    public boolean takePhotoForStreamUpload(
+            String photoFilePath,
+            String requestId,
+            String uploadUrl,
+            String size,
+            boolean enableSound,
+            PhotoCaptureSettings captureSettings) {
+        final PhotoCaptureSettings settings =
+                captureSettings != null ? captureSettings : PhotoCaptureSettings.EMPTY;
+        if (CameraRestartCooldown.isActive()) {
+            sendPhotoErrorResponse(requestId, "CAMERA_BUSY", "Camera restarting after FOV change");
+            return false;
+        }
+        if (!acquirePhotoJob(requestId)) {
+            sendPhotoErrorResponse(requestId, "CAMERA_BUSY", "Another photo job is in progress");
+            return false;
+        }
+        startCaptureSafetyTimeout(requestId);
+        final long acceptedAtMs = System.currentTimeMillis();
+        final AtomicBoolean cameraReturned = new AtomicBoolean(false);
+        final AtomicBoolean finished = new AtomicBoolean(false);
+        Log.i(
+                TAG,
+                "[STREAM_PHOTO] accepted requestId="
+                        + requestId
+                        + " size="
+                        + size
+                        + " uploadUrl="
+                        + uploadUrl);
+        sendPhotoStatus(requestId, "accepted");
+
+        Runnable returnCamera =
+                () -> {
+                    if (cameraReturned.compareAndSet(false, true)) {
+                        WhipStreamingService.resumeCameraAfterStill(requestId, "photo_done");
+                    }
+                };
+
+        WhipStreamingService.suspendCameraForStill(
+                requestId,
+                new WhipStreamingService.StillCameraCallback() {
+                    @Override
+                    public void onUnavailable(String errorCode, String message) {
+                        if (!finished.compareAndSet(false, true)) return;
+                        releasePhotoJob(requestId);
+                        sendPhotoErrorResponse(requestId, errorCode, message);
+                    }
+
+                    @Override
+                    public void onCameraReleased() {
+                        long cameraLentAtMs = System.currentTimeMillis();
+                        try {
+                            captureStreamStill(
+                                    photoFilePath,
+                                    requestId,
+                                    uploadUrl,
+                                    size,
+                                    enableSound,
+                                    settings,
+                                    acceptedAtMs,
+                                    cameraLentAtMs,
+                                    returnCamera,
+                                    finished);
+                        } catch (RuntimeException e) {
+                            Log.e(TAG, "[STREAM_PHOTO] capture could not start " + requestId, e);
+                            returnCamera.run();
+                            if (finished.compareAndSet(false, true)) {
+                                releasePhotoJob(requestId);
+                                sendPhotoErrorResponse(
+                                        requestId,
+                                        "CAMERA_CAPTURE_FAILED",
+                                        "Stream photo could not start: " + e.getMessage());
+                            }
+                        }
+                    }
+                });
+        return true;
+    }
+
+    private void captureStreamStill(
+            String photoFilePath,
+            String requestId,
+            String uploadUrl,
+            String size,
+            boolean enableSound,
+            PhotoCaptureSettings captureSettings,
+            long acceptedAtMs,
+            long cameraLentAtMs,
+            Runnable returnCamera,
+            AtomicBoolean finished) {
+        boolean suppressPhotoFeedback = shouldSuppressPhotoFeedback();
+        final PhotoLightController.Token lightToken =
+                photoLightController.prepare(requestId, !suppressPhotoFeedback);
+        final PhotoFeedbackController.Token feedbackToken =
+                !suppressPhotoFeedback && enableSound
+                        ? startPhotoFeedback(requestId, size, true, null, captureSettings)
+                        : null;
+        CameraNeoService.enqueuePhotoRequest(
+                mContext,
+                photoFilePath,
+                size,
+                true,
+                true,
+                null,
+                null,
+                captureSettings,
+                true,
+                false,
+                new CameraNeoService.PhotoCaptureCallback() {
+                    @Override
+                    public void onPhotoCapturing(
+                            JSONObject requestedCaptureConfig, JSONObject meteredPreview) {
+                        sendPhotoStatus(requestId, "capturing");
+                    }
+
+                    @Override
+                    public void onPhotoExposureStarted(
+                            long sensorTimestampNs, long estimatedExposureDurationNs) {
+                        photoLightController.onCaptureBoundary(
+                                lightToken, "sensor exposure", estimatedExposureDurationNs);
+                        photoFeedbackController.onExposureStarted(
+                                feedbackToken, sensorTimestampNs, estimatedExposureDurationNs);
+                    }
+
+                    @Override
+                    public void onPhotoFrameAvailable(long sensorTimestampNs) {
+                        photoLightController.onCaptureBoundary(lightToken, "JPEG frame fallback");
+                        photoFeedbackController.playSnap(feedbackToken, "JPEG frame available");
+                    }
+
+                    @Override
+                    public void onPhotoCaptured(String filePath, JSONObject captureMetadata) {
+                        onPhotoCaptured(filePath, captureMetadata, null);
+                    }
+
+                    @Override
+                    public void onPhotoCaptured(
+                            String filePath,
+                            JSONObject captureMetadata,
+                            CapturedPhoto capturedPhoto) {
+                        long capturedAtMs = System.currentTimeMillis();
+                        photoLightController.onCaptureBoundary(
+                                lightToken, "photo completion fallback");
+                        photoFeedbackController.playSnap(feedbackToken, "photo completion fallback");
+                        // The stream needs the camera more than the upload does.
+                        returnCamera.run();
+                        byte[] jpeg = capturedPhoto != null ? capturedPhoto.jpegBytes : null;
+                        if (jpeg == null) jpeg = readStreamStillFile(filePath);
+                        final byte[] body = jpeg;
+                        sendPhotoStatus(requestId, "uploading");
+                        new Thread(
+                                        () ->
+                                                uploadStreamStill(
+                                                        requestId,
+                                                        uploadUrl,
+                                                        body,
+                                                        filePath,
+                                                        acceptedAtMs,
+                                                        cameraLentAtMs,
+                                                        capturedAtMs,
+                                                        finished),
+                                        "StreamPhotoUpload")
+                                .start();
+                    }
+
+                    @Override
+                    public void onPhotoFailureDetected() {
+                        photoLightController.finish(lightToken);
+                        photoFeedbackController.stopForFailure(feedbackToken);
+                    }
+
+                    @Override
+                    public void onPhotoError(String errorMessage) {
+                        onPhotoError(CameraOperationError.captureFailed(errorMessage));
+                    }
+
+                    @Override
+                    public void onPhotoError(CameraOperationError error) {
+                        photoLightController.finish(lightToken);
+                        photoFeedbackController.stopForFailure(feedbackToken);
+                        returnCamera.run();
+                        Log.e(TAG, "[STREAM_PHOTO] capture failed " + requestId + ": " + error.message());
+                        if (!finished.compareAndSet(false, true)) return;
+                        releasePhotoJob(requestId);
+                        sendPhotoErrorResponse(requestId, error.code(), error.message());
+                    }
+                });
+    }
+
+    @Nullable
+    private static byte[] readStreamStillFile(String filePath) {
+        if (filePath == null) return null;
+        File file = new File(filePath);
+        if (!file.isFile()) return null;
+        try (FileInputStream input = new FileInputStream(file)) {
+            byte[] bytes = new byte[(int) file.length()];
+            int read = 0;
+            while (read < bytes.length) {
+                int count = input.read(bytes, read, bytes.length - read);
+                if (count < 0) break;
+                read += count;
+            }
+            return read == bytes.length ? bytes : null;
+        } catch (java.io.IOException e) {
+            Log.w(TAG, "[STREAM_PHOTO] could not read captured file " + filePath, e);
+            return null;
+        } finally {
+            //noinspection ResultOfMethodCallIgnored
+            file.delete();
+        }
+    }
+
+    private void uploadStreamStill(
+            String requestId,
+            String uploadUrl,
+            @Nullable byte[] jpeg,
+            String filePath,
+            long acceptedAtMs,
+            long cameraLentAtMs,
+            long capturedAtMs,
+            AtomicBoolean finished) {
+        if (filePath != null) {
+            //noinspection ResultOfMethodCallIgnored
+            new File(filePath).delete();
+        }
+        String errorCode = null;
+        String errorMessage = null;
+        int status = -1;
+        long uploadStartedAtMs = System.currentTimeMillis();
+        if (jpeg == null || jpeg.length == 0) {
+            errorCode = "PHOTO_SAVE_FAILED";
+            errorMessage = "Stream photo produced no JPEG";
+        } else {
+            java.net.HttpURLConnection connection = null;
+            try {
+                connection =
+                        (java.net.HttpURLConnection) new java.net.URL(uploadUrl).openConnection();
+                connection.setConnectTimeout(AsgConstants.STREAM_PHOTO_UPLOAD_CONNECT_TIMEOUT_MS);
+                connection.setReadTimeout(AsgConstants.STREAM_PHOTO_UPLOAD_IO_TIMEOUT_MS);
+                connection.setRequestMethod("POST");
+                connection.setDoOutput(true);
+                connection.setUseCaches(false);
+                connection.setFixedLengthStreamingMode(jpeg.length);
+                connection.setRequestProperty("Content-Type", "image/jpeg");
+                connection.setRequestProperty("X-Mentra-Request-Id", requestId);
+                try (java.io.OutputStream output = connection.getOutputStream()) {
+                    output.write(jpeg);
+                }
+                status = connection.getResponseCode();
+                if (status < 200 || status >= 300) {
+                    errorCode = "UPLOAD_FAILED";
+                    errorMessage = "Phone rejected the stream photo with HTTP " + status;
+                }
+            } catch (Exception e) {
+                errorCode = "UPLOAD_FAILED";
+                errorMessage = "Stream photo upload failed: " + e.getMessage();
+            } finally {
+                if (connection != null) connection.disconnect();
+            }
+        }
+        long doneAtMs = System.currentTimeMillis();
+        Log.i(
+                TAG,
+                "[STREAM_PHOTO] upload done requestId="
+                        + requestId
+                        + " status="
+                        + status
+                        + " bytes="
+                        + (jpeg != null ? jpeg.length : 0)
+                        + " cameraLendMs="
+                        + (cameraLentAtMs - acceptedAtMs)
+                        + " captureMs="
+                        + (capturedAtMs - cameraLentAtMs)
+                        + " uploadMs="
+                        + (doneAtMs - uploadStartedAtMs)
+                        + " totalMs="
+                        + (doneAtMs - acceptedAtMs)
+                        + (errorCode != null ? " error=" + errorCode : ""));
+        if (!finished.compareAndSet(false, true)) return;
+        releasePhotoJob(requestId);
+        if (errorCode != null) {
+            sendPhotoErrorResponse(requestId, errorCode, errorMessage);
+            return;
+        }
+        try {
+            JSONObject json = new JSONObject();
+            json.put("type", "photo_response");
+            json.put("requestId", requestId);
+            json.put("state", "success");
+            json.put("success", true);
+            json.put("uploadUrl", uploadUrl);
+            json.put("streamPhoto", true);
+            json.put("bytes", jpeg.length);
+            JSONObject timings = new JSONObject();
+            timings.put("cameraLendMs", cameraLentAtMs - acceptedAtMs);
+            timings.put("captureMs", capturedAtMs - cameraLentAtMs);
+            timings.put("uploadMs", doneAtMs - uploadStartedAtMs);
+            timings.put("totalMs", doneAtMs - acceptedAtMs);
+            json.put("timings", timings);
+            json.put("timestamp", doneAtMs);
+            if (mServiceCallback != null) {
+                mServiceCallback.sendThroughBluetooth(json.toString().getBytes());
+            } else {
+                Log.e(TAG, "❌ Service callback not available for stream photo response");
+            }
+        } catch (JSONException e) {
+            Log.e(TAG, "❌ Error creating stream photo response", e);
+        }
+    }
+
+    /**
      * Take a photo and upload it to the specified destination
      *
      * @param photoFilePath Local path where photo will be saved
@@ -2612,7 +3070,7 @@ public class MediaCaptureService {
      * @param size Photo size
      * @param enableFlash Whether to enable privacy flash LED
      * @param enableSound Whether to enable shutter sound
-     * @param compress Compression level (none, medium, heavy)
+     * @param compress Compression level (none, low, medium, high)
      * @param exposureTimeNs optional sensor exposure time in nanoseconds for this capture only;
      *     {@code null} = auto
      * @param iso optional sensor sensitivity for manual exposure captures only; {@code null} =
@@ -2672,7 +3130,7 @@ public class MediaCaptureService {
         // Check battery level before proceeding
         if (mStateManager != null) {
             int batteryLevel = mStateManager.getBatteryLevel();
-            if (batteryLevel >= 0 && batteryLevel < BatteryConstants.MIN_BATTERY_LEVEL) {
+            if (BatteryConstants.isCameraBatteryLow(batteryLevel, hardwareManager)) {
                 Log.w(TAG, "🚫 Photo rejected - battery too low (" + batteryLevel + "%)");
                 playBatteryLowSound();
                 sendPhotoErrorResponse(
@@ -2715,6 +3173,7 @@ public class MediaCaptureService {
         // Track requested size for potential fallbacks
         photoRequestedSizes.put(requestId, size);
         photoRequestedModes.put(requestId, mode);
+        photoRequestedCompression.put(requestId, PhotoCompression.fromValue(compress));
 
         Log.d(TAG, "Taking photo and uploading to " + webhookUrl);
 
@@ -2749,7 +3208,7 @@ public class MediaCaptureService {
 
         boolean suppressPhotoFeedback = shouldSuppressPhotoFeedback();
         final PhotoLightController.Token captureLightToken =
-                photoLightController.prepare(!suppressPhotoFeedback);
+                photoLightController.prepare(requestId, !suppressPhotoFeedback);
         PhotoFeedbackController.Token feedbackToken = null;
         try {
             // Skip sound and flash during camera HAL restart cooldown (e.g. after FOV change)
@@ -2764,9 +3223,6 @@ public class MediaCaptureService {
                                     true,
                                     exposureTimeNs,
                                     captureSettings);
-                }
-                if (enableFlash) {
-                    flashPrivacyLedForPhoto();
                 }
             }
             final PhotoFeedbackController.Token captureFeedbackToken = feedbackToken;
@@ -2891,8 +3347,7 @@ public class MediaCaptureService {
                                     null,
                                     captureMetadata);
 
-                            // LED is now managed by CameraNeoService and will turn off when camera
-                            // closes
+                            // PhotoSession owns the privacy LED through final JPEG arrival.
 
                             // Notify that we've captured the photo
                             if (mMediaCaptureListener != null) {
@@ -3004,6 +3459,7 @@ public class MediaCaptureService {
 
                         @Override
                         public void onPhotoFailureDetected() {
+                            photoLightController.finish(captureLightToken);
                             photoFeedbackController.stopForFailure(captureFeedbackToken);
                         }
 
@@ -3014,6 +3470,7 @@ public class MediaCaptureService {
 
                         @Override
                         public void onPhotoError(CameraOperationError error) {
+                            photoLightController.finish(captureLightToken);
                             photoFeedbackController.stopForFailure(captureFeedbackToken);
                             cleanupPhotoArtifacts(requestId, photoFilePath, false);
                             clearPhotoTracking(requestId);
@@ -3022,8 +3479,7 @@ public class MediaCaptureService {
                             Log.e(TAG, "Failed to capture photo: " + error.message());
                             sendPhotoErrorResponse(requestId, error.code(), error.message());
 
-                            // LED is now managed by CameraNeoService and will turn off when camera
-                            // closes
+                            // PhotoSession owns the privacy LED through final JPEG arrival.
 
                             dumpTimings(requestId);
 
@@ -3037,6 +3493,7 @@ public class MediaCaptureService {
                     });
             return true;
         } catch (Exception e) {
+            photoLightController.finish(captureLightToken);
             photoFeedbackController.stopForFailure(feedbackToken);
             cleanupPhotoArtifacts(requestId, photoFilePath, false);
             clearPhotoTracking(requestId);
@@ -3093,10 +3550,13 @@ public class MediaCaptureService {
     /**
      * Start the photo-job safety timeout. If no terminal callback fires (e.g., CameraNeo crashes,
      * lock timeout, upload thread dies), force-reset isPhotoJobInFlight after
-     * CAPTURE_SAFETY_TIMEOUT_MS to prevent permanent lockout. Sized to outlast a slow webhook
-     * upload.
+     * the request budget to prevent permanent lockout. Preview requests reserve time for all
+     * three phases, and the SDK allows a small additional terminal-event transit margin.
      */
     private void startCaptureSafetyTimeout(String requestId) {
+        final long timeoutMs = photoThumbnailIds.containsKey(requestId)
+                ? AsgConstants.PHOTO_THUMBNAIL_JOB_TIMEOUT_MS
+                : AsgConstants.PHOTO_CAPTURE_TIMEOUT_MS;
         Runnable timeout =
                 new Runnable() {
                     @Override
@@ -3110,11 +3570,12 @@ public class MediaCaptureService {
                                 captureSafetyTimeoutRequestId = null;
                             }
                         }
+                        photoLightController.finishForTimeout(requestId);
                         photoFeedbackController.stopForTimeout(requestId);
                         Log.e(
                                 TAG,
                                 "⚠️ SAFETY TIMEOUT: isPhotoJobInFlight force-reset after "
-                                        + CAPTURE_SAFETY_TIMEOUT_MS
+                                        + timeoutMs
                                         + "ms - no terminal callback fired for "
                                         + requestId);
                         dumpTimings(requestId);
@@ -3129,7 +3590,7 @@ public class MediaCaptureService {
             captureSafetyTimeout = timeout;
             captureSafetyTimeoutRequestId = requestId;
         }
-        mainHandler.postDelayed(timeout, CAPTURE_SAFETY_TIMEOUT_MS);
+        mainHandler.postDelayed(timeout, timeoutMs);
     }
 
     /** Cancel the capture safety timeout (called when callback fires normally). */
@@ -3161,6 +3622,11 @@ public class MediaCaptureService {
      */
     public void onBlePhotoTransferComplete(String bleImgId, boolean success) {
         if (bleImgId == null || bleImgId.isEmpty()) {
+            return;
+        }
+        java.util.concurrent.CompletableFuture<Boolean> thumbnailAck = thumbnailAcks.get(bleImgId);
+        if (thumbnailAck != null) {
+            thumbnailAck.complete(success);
             return;
         }
         String requestId = bleImgIdToRequestId.remove(bleImgId);
@@ -3820,157 +4286,81 @@ public class MediaCaptureService {
             String authToken,
             String compress) {
         String uploadPath = prepareTextModePhotoPath(photoFilePath, requestId);
+        if (photoThumbnailIds.containsKey(requestId)) {
+            new Thread(
+                            () -> {
+                                android.graphics.Bitmap bitmap = null;
+                                try {
+
+                                    android.graphics.BitmapFactory.Options options =
+                                            new android.graphics.BitmapFactory.Options();
+                                    options.inJustDecodeBounds = true;
+                                    android.graphics.BitmapFactory.decodeFile(uploadPath, options);
+                                    options.inSampleSize = 1;
+                                    while (Math.max(options.outWidth, options.outHeight)
+                                                    / (options.inSampleSize * 2)
+                                            >= AsgConstants.PHOTO_THUMBNAIL_LONG_EDGE)
+                                        options.inSampleSize *= 2;
+                                    options.inJustDecodeBounds = false;
+                                    bitmap =
+                                            android.graphics.BitmapFactory.decodeFile(
+                                                    uploadPath, options);
+                                    if (bitmap == null)
+                                        throw new java.io.IOException(
+                                                "Could not decode thumbnail source");
+
+                                    // The full direct upload retains this EXIF transform. Bake it into
+                                    // the preview pixels so data-URI consumers need no EXIF support.
+                                    int orientation = PhotoOrientation.read(null, uploadPath);
+                                    presendThumbnail(bitmap, requestId, orientation);
+                                    processUploadWithCompression(
+                                            uploadPath, requestId, webhookUrl, authToken, compress);
+                                } catch (Exception e) {
+                                    Log.e(TAG, "Thumbnail presend failed: " + requestId, e);
+                                    sendPhotoErrorResponse(
+                                            requestId,
+                                            "THUMBNAIL_FAILED",
+                                            "Thumbnail presend failed");
+                                    cleanupPhotoArtifacts(
+                                            requestId,
+                                            uploadPath,
+                                            Boolean.TRUE.equals(photoSaveFlags.get(requestId)));
+                                    clearPhotoTracking(requestId);
+                                    releasePhotoJob(requestId);
+                                } finally {
+                                    if (bitmap != null) bitmap.recycle();
+                                }
+                            },
+                            "PhotoThumbnail")
+                    .start();
+            return;
+        }
         Log.d(TAG, "📸 Processing photo upload with SDK compression setting: " + compress);
 
-        // Check SDK compression setting
-        if ("none".equals(compress) || compress == null || compress.isEmpty()) {
-            Log.d(TAG, "📸 No compression requested - uploading original image");
-            performDirectUpload(uploadPath, requestId, webhookUrl, authToken);
-        } else {
-            Log.d(TAG, "🗜️ Compression requested - applying SDK compression setting: " + compress);
-            sendPhotoStatus(requestId, "compressing");
-
-            compressImageForUpload(uploadPath, requestId, webhookUrl, authToken, compress);
-        }
+        PhotoCompression policy = PhotoCompression.fromValue(compress);
+        sendPhotoStatus(requestId, "compressing");
+        compressImageForUpload(uploadPath, requestId, webhookUrl, authToken, policy);
     }
 
-    /** Compress image based on SDK compression level */
+    /** Apply the same JPEG quality as BLE without extra resizing. */
     private void compressImageForUpload(
-            String originalPath,
-            String requestId,
-            String webhookUrl,
-            String authToken,
-            String compress) {
-        new Thread(
-                        () -> {
-                            try {
-                                Log.d(
-                                        TAG,
-                                        "🗜️ Starting image compression for "
-                                                + compress
-                                                + " level");
-                                long compressionStartTime = System.currentTimeMillis();
-
-                                // Load original image
-                                android.graphics.Bitmap original =
-                                        android.graphics.BitmapFactory.decodeFile(originalPath);
-                                if (original == null) {
-                                    Log.e(TAG, "❌ Failed to load original image for compression");
-                                    performDirectUpload(
-                                            originalPath, requestId, webhookUrl, authToken);
-                                    return;
-                                }
-
-                                // Calculate compression parameters based on SDK compression level
-                                int originalWidth = original.getWidth();
-                                int originalHeight = original.getHeight();
-                                Log.d(
-                                        TAG,
-                                        "📐 Original image dimensions: "
-                                                + originalWidth
-                                                + "x"
-                                                + originalHeight);
-
-                                // Compression parameters based on SDK compression level
-                                float compressionRatio;
-                                int jpegQuality;
-                                String compressionStrategy;
-
-                                if ("heavy".equals(compress)) {
-                                    compressionRatio = 0.50f; // 50% of original size
-                                    jpegQuality = 60;
-                                    compressionStrategy = "50% size + 60% quality (HEAVY)";
-                                } else { // "medium"
-                                    compressionRatio = 0.75f; // 75% of original size
-                                    jpegQuality = 80;
-                                    compressionStrategy = "75% size + 80% quality (MEDIUM)";
-                                }
-
-                                Log.d(TAG, "🎯 Compression strategy: " + compressionStrategy);
-
-                                // Calculate compressed dimensions
-                                int compressedWidth = (int) (originalWidth * compressionRatio);
-                                int compressedHeight = (int) (originalHeight * compressionRatio);
-
-                                // Maintain aspect ratio
-                                float aspectRatio = (float) originalWidth / originalHeight;
-                                if (aspectRatio > 1) {
-                                    compressedHeight = (int) (compressedWidth / aspectRatio);
-                                } else {
-                                    compressedWidth = (int) (compressedHeight * aspectRatio);
-                                }
-
-                                Log.d(
-                                        TAG,
-                                        "📐 Compressed image dimensions: "
-                                                + compressedWidth
-                                                + "x"
-                                                + compressedHeight);
-
-                                // Create compressed bitmap
-                                android.graphics.Bitmap compressed =
-                                        android.graphics.Bitmap.createScaledBitmap(
-                                                original, compressedWidth, compressedHeight, true);
-                                original.recycle();
-
-                                // Save compressed image to temporary file
-                                String compressedPath =
-                                        originalPath.replace(
-                                                ".jpg", "_compressed_" + compress + ".jpg");
-                                FileOutputStream fos = new FileOutputStream(compressedPath);
-                                compressed.compress(
-                                        android.graphics.Bitmap.CompressFormat.JPEG,
-                                        jpegQuality,
-                                        fos);
-                                fos.close();
-                                compressed.recycle();
-
-                                PhotoExifMetadataWriter.copyImuMetadata(
-                                        originalPath, compressedPath);
-
-                                long compressionDuration =
-                                        System.currentTimeMillis() - compressionStartTime;
-                                Log.d(
-                                        TAG,
-                                        "⏱️ Image compression completed in: "
-                                                + compressionDuration
-                                                + "ms");
-                                Log.d(TAG, "✅ Compressed image saved: " + compressedPath);
-
-                                // Calculate compression ratio achieved
-                                File originalFile = new File(originalPath);
-                                File compressedFile = new File(compressedPath);
-                                long originalSize = originalFile.length();
-                                long compressedSize = compressedFile.length();
-                                float sizeReduction =
-                                        ((float) (originalSize - compressedSize) / originalSize)
-                                                * 100;
-
-                                Log.d(TAG, "📊 Compression stats:");
-                                Log.d(TAG, "📊 Original size: " + originalSize + " bytes");
-                                Log.d(TAG, "📊 Compressed size: " + compressedSize + " bytes");
-                                Log.d(
-                                        TAG,
-                                        "📊 Size reduction: "
-                                                + String.format("%.1f", sizeReduction)
-                                                + "%");
-
-                                // Upload compressed version
-                                performDirectUpload(
-                                        compressedPath, requestId, webhookUrl, authToken);
-
-                                // Clean up compressed file after upload
-                                new File(compressedPath).deleteOnExit();
-
-                            } catch (Exception e) {
-                                Log.e(
-                                        TAG,
-                                        "❌ Error compressing image, falling back to original: "
-                                                + e.getMessage());
-                                performDirectUpload(originalPath, requestId, webhookUrl, authToken);
-                            }
-                        })
-                .start();
+        String originalPath, String requestId, String webhookUrl, String authToken,
+        PhotoCompression policy) {
+      new Thread(() -> {
+        String compressedPath = originalPath + ".upload.jpg";
+        try {
+          // Size/crop belong to capture and transport policy, not compression strength.
+          performDirectUpload(
+              policy.prepareUpload(originalPath, compressedPath), requestId, webhookUrl, authToken);
+        } catch (Exception e) {
+          Log.e(TAG, "Photo compression failed: " + requestId, e);
+          sendPhotoErrorResponse(requestId, "COMPRESSION_FAILED", e.getMessage());
+          cleanupPhotoArtifacts(requestId, compressedPath,
+              Boolean.TRUE.equals(photoSaveFlags.get(requestId)));
+          clearPhotoTracking(requestId);
+          releasePhotoJob(requestId);
+        }
+      }, "PhotoUploadCompression").start();
     }
 
     /** Compress image for poor connection scenarios (legacy method - kept for compatibility) */
@@ -4887,7 +5277,7 @@ public class MediaCaptureService {
      * @param webhookUrl Webhook URL for upload
      * @param bleImgId BLE image ID for fallback
      * @param save Whether to keep the photo on device
-     * @param compress Compression level (none, medium, heavy)
+     * @param compress Compression level (none, low, medium, high)
      * @param exposureTimeNs optional sensor exposure time in nanoseconds for this capture only;
      *     {@code null} = auto
      * @param iso optional sensor sensitivity for manual exposure captures only; {@code null} =
@@ -4922,7 +5312,7 @@ public class MediaCaptureService {
         // Check battery level before proceeding (defense-in-depth)
         if (mStateManager != null) {
             int batteryLevel = mStateManager.getBatteryLevel();
-            if (batteryLevel >= 0 && batteryLevel < BatteryConstants.MIN_BATTERY_LEVEL) {
+            if (BatteryConstants.isCameraBatteryLow(batteryLevel, hardwareManager)) {
                 Log.w(TAG, "🚫 Photo rejected - battery too low (" + batteryLevel + "%)");
                 playBatteryLowSound();
                 sendPhotoErrorResponse(
@@ -4946,6 +5336,7 @@ public class MediaCaptureService {
             photoOriginalPaths.put(requestId, photoFilePath);
             photoRequestedSizes.put(requestId, size);
             photoRequestedModes.put(requestId, mode);
+            photoRequestedCompression.put(requestId, PhotoCompression.fromValue(compress));
             tracePhotoWifiRoute(requestId, "direct_webhook", "wifi_connected", webhookUrl, null);
 
             Log.d(TAG, "📶 WiFi connected - attempting direct upload for " + requestId);
@@ -4976,6 +5367,7 @@ public class MediaCaptureService {
                     mode,
                     enableFlash,
                     enableSound,
+                    compress,
                     exposureTimeNs,
                     iso,
                     captureSettings);
@@ -5003,6 +5395,7 @@ public class MediaCaptureService {
             String mode,
             boolean enableFlash,
             boolean enableSound,
+            String compress,
             Long exposureTimeNs,
             Integer iso,
             PhotoCaptureSettings captureSettings) {
@@ -5060,7 +5453,7 @@ public class MediaCaptureService {
         logBlePhotoStep(requestId, "battery_check", "checking minimum battery requirement");
         if (mStateManager != null) {
             int batteryLevel = mStateManager.getBatteryLevel();
-            if (batteryLevel >= 0 && batteryLevel < BatteryConstants.MIN_BATTERY_LEVEL) {
+            if (BatteryConstants.isCameraBatteryLow(batteryLevel, hardwareManager)) {
                 Log.w(TAG, "🚫 Photo rejected - battery too low (" + batteryLevel + "%)");
                 playBatteryLowSound();
                 sendPhotoErrorResponse(
@@ -5115,6 +5508,7 @@ public class MediaCaptureService {
         // Track requested size for BLE compression
         photoRequestedSizes.put(requestId, size);
         photoRequestedModes.put(requestId, mode);
+        photoRequestedCompression.put(requestId, PhotoCompression.fromValue(compress));
         // Notify that we're about to take a photo
         if (mMediaCaptureListener != null) {
             mMediaCaptureListener.onPhotoCapturing(requestId);
@@ -5148,7 +5542,7 @@ public class MediaCaptureService {
         // Skip sound and flash during camera HAL restart cooldown (e.g. after FOV change)
         boolean suppressPhotoFeedback = shouldSuppressPhotoFeedback();
         final PhotoLightController.Token captureLightToken =
-                photoLightController.prepare(!suppressPhotoFeedback);
+                photoLightController.prepare(requestId, !suppressPhotoFeedback);
         PhotoFeedbackController.Token feedbackToken = null;
         if (!suppressPhotoFeedback) {
             if (enableSound) {
@@ -5161,9 +5555,6 @@ public class MediaCaptureService {
                                 true,
                                 exposureTimeNs,
                                 captureSettings);
-            }
-            if (enableFlash) {
-                flashPrivacyLedForPhoto();
             }
         }
         final PhotoFeedbackController.Token captureFeedbackToken = feedbackToken;
@@ -5317,8 +5708,7 @@ public class MediaCaptureService {
                                     null,
                                     captureMetadata);
 
-                            // LED is now managed by CameraNeoService and will turn off when camera
-                            // closes
+                            // PhotoSession owns the privacy LED through final JPEG arrival.
 
                             // Notify that we've captured the photo
                             if (mMediaCaptureListener != null) {
@@ -5333,6 +5723,7 @@ public class MediaCaptureService {
 
                         @Override
                         public void onPhotoFailureDetected() {
+                            photoLightController.finish(captureLightToken);
                             photoFeedbackController.stopForFailure(captureFeedbackToken);
                         }
 
@@ -5343,6 +5734,7 @@ public class MediaCaptureService {
 
                         @Override
                         public void onPhotoError(CameraOperationError error) {
+                            photoLightController.finish(captureLightToken);
                             photoFeedbackController.stopForFailure(captureFeedbackToken);
                             BlePhotoTimingLog.unbindPhaseSink(capturePhaseSink);
                             cleanupPhotoArtifacts(requestId, photoFilePath, false);
@@ -5351,8 +5743,7 @@ public class MediaCaptureService {
 
                             Log.e(TAG, "Failed to capture photo for BLE: " + error.message());
 
-                            // LED is now managed by CameraNeoService and will turn off when camera
-                            // closes
+                            // PhotoSession owns the privacy LED through final JPEG arrival.
 
                             dumpTimings(requestId);
                             sendPhotoErrorResponse(requestId, error.code(), error.message());
@@ -5367,6 +5758,7 @@ public class MediaCaptureService {
                     });
             return true;
         } catch (Exception e) {
+            photoLightController.finish(captureLightToken);
             photoFeedbackController.stopForFailure(captureFeedbackToken);
             BlePhotoTimingLog.unbindPhaseSink(null);
             cleanupPhotoArtifacts(requestId, photoFilePath, false);
@@ -5448,6 +5840,7 @@ public class MediaCaptureService {
                         () -> {
                             long compressThreadStart = System.currentTimeMillis();
                             boolean bleTransferStarted = false;
+                            ThumbnailTransfer thumbnailTransfer = null;
                             android.graphics.Rect detectedTextRoi = null;
                             CompressStageTimer stage = new CompressStageTimer();
                             recordTiming(requestId, "ble_compress_start");
@@ -5500,6 +5893,8 @@ public class MediaCaptureService {
                                     // handoff.
                                     prepareTextModePhotoPath(originalPath, requestId);
                                 }
+                                int sourceOrientation = PhotoOrientation.read(
+                                        capturedPhoto != null ? capturedPhoto.jpegBytes : null, originalPath);
                                 boolean textSelectionAlreadyPrepared =
                                         Boolean.TRUE.equals(photoTextCropPrepared.get(requestId));
                                 boolean textCropAlreadyApplied =
@@ -5609,8 +6004,7 @@ public class MediaCaptureService {
                                                 + ", quality="
                                                 + (codec == BleCodec.AVIF
                                                         ? bleParams.avifQuality
-                                                        : AsgConstants
-                                                                .BLE_PHOTO_JPEG_FAST_QUALITY));
+                                                        : resolveBleJpegQuality(requestId)));
                                 if (textModeRequested) {
                                     Log.d(
                                             TAG,
@@ -5886,6 +6280,15 @@ public class MediaCaptureService {
                                         cropped = original;
                                     }
 
+                                    // Deliver the preview before spending time resizing/encoding
+                                    // the full BLE image. Use the same crop for both images.
+                                    try {
+                                        thumbnailTransfer = startThumbnail(cropped, requestId, sourceOrientation);
+                                    } catch (Exception e) {
+                                        cropped.recycle();
+                                        throw e;
+                                    }
+
                                     // COMPRESS phase begins only after crop (or immediately when
                                     // cropping was not requested).
                                     logBlePhotoStep(requestId, "image_process_start");
@@ -5967,6 +6370,23 @@ public class MediaCaptureService {
                                                 + textCropOutcome);
                                 final int bleResizedWidth = resized.getWidth();
                                 final int bleResizedHeight = resized.getHeight();
+                                try {
+                                    // The grayscale processor fuses decode/crop/resize; color
+                                    // previews have already been sent before full-image resize.
+                                    if (AsgConstants.ENABLE_GRAYSCALE_BLE_PHOTOS) {
+                                        thumbnailTransfer = startThumbnail(resized, requestId, sourceOrientation);
+                                    }
+                                } catch (Exception e) {
+                                    resized.recycle();
+                                    throw e;
+                                }
+
+                                // BLE encoders write tagless pixels. Normalize the full image using
+                                // the same transform as the preview, also when Wi-Fi failed after an
+                                // oriented direct-upload preview was already acknowledged.
+                                android.graphics.Bitmap oriented = PhotoOrientation.apply(resized, sourceOrientation);
+                                if (oriented != resized) resized.recycle();
+                                resized = oriented;
 
                                 // 3. Encode with the policy-selected BLE codec. Text mode and
                                 // ordinary size-tier photos share this exact codec/quality
@@ -5975,7 +6395,7 @@ public class MediaCaptureService {
                                 int encodeQuality =
                                         codec == BleCodec.AVIF
                                                 ? bleParams.avifQuality
-                                                : AsgConstants.BLE_PHOTO_JPEG_FAST_QUALITY;
+                                                : resolveBleJpegQuality(requestId);
                                 Log.d(
                                         TAG,
                                         "BLE encode: originalPath="
@@ -6265,6 +6685,9 @@ public class MediaCaptureService {
                                 // The K900 packet pump streams from an in-memory buffer (including
                                 // retries), so no transport artifact is written to disk. bleImgId
                                 // is the wire name (16-char protocol cap, no extension).
+                                // Encoding overlaps thumbnail delivery; main-image transmission
+                                // still waits for the thumbnail's phone ACK and transport release.
+                                if (thumbnailTransfer != null) thumbnailTransfer.await();
                                 recordTiming(requestId, "ble_send_start");
                                 bleTransferStarted =
                                         sendCompressedPhotoViaBle(
@@ -6292,6 +6715,7 @@ public class MediaCaptureService {
                                 sendPhotoErrorResponse(
                                         requestId, "BLE_TRANSFER_FAILED", e.getMessage());
                             } finally {
+                                if (thumbnailTransfer != null) thumbnailTransfer.close();
                                 logBlePhotoStep(
                                         requestId,
                                         "cleanup_start",
@@ -6972,8 +7396,7 @@ public class MediaCaptureService {
 
                             int batteryLevel = hardwareManager.getBatteryLevel();
 
-                            if (batteryLevel >= 0
-                                    && batteryLevel < BatteryConstants.MIN_BATTERY_LEVEL) {
+                            if (BatteryConstants.isCameraBatteryLow(batteryLevel, hardwareManager)) {
                                 Log.w(
                                         TAG,
                                         "🔋⚠️ Battery dropped to "
@@ -7054,6 +7477,10 @@ public class MediaCaptureService {
      * prevent leaks.
      */
     public void cleanup() {
+        // Release workers waiting on a thumbnail ACK when the service is torn down.
+        thumbnailAcks.values().forEach(ack -> ack.cancel(false));
+        thumbnailAcks.clear();
+        photoThumbnailIds.clear();
         assertMainThread();
         Log.d(TAG, "🧹 MediaCaptureService cleanup() called");
         isCleaningUp.set(true);
@@ -7061,6 +7488,7 @@ public class MediaCaptureService {
 
         try {
             photoFeedbackController.cleanup();
+            photoLightController.cleanup();
 
             // Stop battery monitoring
             stopBatteryMonitoring();

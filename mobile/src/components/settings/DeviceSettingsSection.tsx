@@ -11,11 +11,9 @@ import {showAlert} from "@/contexts/ModalContext"
 import {useEngineSnapshot} from "@/hooks/useEngineSnapshot"
 import {translate} from "@/i18n/translate"
 import {useNavigationStore} from "@/stores/navigation"
-import {SETTINGS, useSetting} from "@mentra/engine"
+import {deploymentStore} from "@/services/deployment"
+import {SETTINGS, useSetting, Capabilities, DeviceTypes, getModelCapabilities, engine} from "@mentra/engine"
 import {getGlassesImage} from "@/utils/getGlassesImage"
-
-import {Capabilities, DeviceTypes, getModelCapabilities} from "@mentra/engine"
-import {engine} from "@mentra/engine"
 
 import OtaProgressSection from "@/components/glasses/OtaProgressSection"
 import {Ar99OtaModal} from "@/components/settings/Ar99OtaModal"
@@ -54,8 +52,8 @@ export function useHasDeviceInfo(): boolean {
  * layout), with capability-specific rows (G2 menu, WiFi, OTA, Nex, Mentra Live
  * button, super-mode tools) slotting in where applicable.
  *
- * Embedded inline on the flattened main settings page. Returns null when no
- * device is paired.
+ * Embedded inline on the flattened main settings page. When no glasses are
+ * paired, still shows Pair controller so a keyfob or ring can be added.
  */
 export function DeviceSettingsSection() {
   const {theme} = useAppTheme()
@@ -64,8 +62,8 @@ export function DeviceSettingsSection() {
   const glassesInfo = useEngineSnapshot(engine.glasses.info, (onChange) => engine.glasses.onInfo(onChange))
   const [autoBrightness, setAutoBrightness] = useSetting(SETTINGS.auto_brightness.key)
   const [brightness, setBrightness] = useSetting(SETTINGS.brightness.key)
-  // Button-action settings are no longer surfaced in the UI — the action button always launches the
-  // camera (forced at runtime in ButtonActions.tsx). See the commented-out ButtonSettings block below.
+  // Button-action settings are no longer surfaced: subscriptions route the button
+  // to miniapps; otherwise the glasses handle native capture without launching an app.
   // const [defaultButtonActionEnabled, setDefaultButtonActionEnabled] = useSetting(
   //   SETTINGS.default_button_action_enabled.key,
   // )
@@ -78,13 +76,18 @@ export function DeviceSettingsSection() {
 
   const {push} = useNavigationStore.getState()
   const features: Capabilities = getModelCapabilities(defaultWearable)
+  const pairControllerButton = (
+    <RouteButton
+      icon={<Icon name="bluetooth" size={24} color={theme.colors.secondary_foreground} />}
+      label={translate("deviceSettings:pairController")}
+      onPress={() => push("/pairing/select-controller")}
+    />
+  )
 
   const otaProgress = otaSnapshot.legacyProgress
-  const isAr99Family =
-    isAr99Identifier(defaultWearable) ||
-    isAr99Identifier(glassesInfo.model) ||
-    isAr99Identifier(glassesInfo.bluetoothName)
+  const isMentraLive = defaultWearable === DeviceTypes.LIVE || String(defaultWearable || "").includes(DeviceTypes.LIVE)
   const showAr99OtaEntry =
+    deploymentStore.getActive().kind === "consumer" &&
     glassesConnected &&
     (isAr99Identifier(defaultWearable) ||
       isAr99Identifier(glassesInfo.model) ||
@@ -107,15 +110,14 @@ export function DeviceSettingsSection() {
       return
     }
     try {
-      await engine.glasses.forget()
+      await engine.glasses.unpair()
       await engine.settings.set(SETTINGS.default_wearable.key, "", false)
       await engine.settings.set(SETTINGS.device_name.key, "", false)
       await engine.settings.set(SETTINGS.device_address.key, "", false)
       await engine.settings.set(SETTINGS.pending_wearable.key, "", false)
       useNavigationStore.getState().clearHistoryAndGoHome()
     } catch (error) {
-      const code =
-        error && typeof error === "object" && "code" in error ? String((error as {code?: unknown}).code) : ""
+      const code = error && typeof error === "object" && "code" in error ? String((error as {code?: unknown}).code) : ""
       // Native used to refuse forget() during CTKD bonding; Unpair now proceeds anyway.
       if (code === "ctkd_bonding_in_progress") {
         await showAlert({
@@ -142,9 +144,9 @@ export function DeviceSettingsSection() {
     }
   }
 
-  // No glasses paired at all — no device section to show.
+  // No glasses paired — still offer the controller list (R1, XIAO Keyfob).
   if (!defaultWearable) {
-    return null
+    return <View style={{gap: theme.spacing.s2}}>{pairControllerButton}</View>
   }
 
   return (
@@ -160,8 +162,8 @@ export function DeviceSettingsSection() {
       {!glassesConnected && <ConnectDeviceButton />}
       {!glassesConnected && <NotConnectedInfo />}
 
-      {/* Display position — binocular glasses only */}
-      {defaultWearable && !isAr99Family && (features?.display?.count ?? 0) > 1 && (
+      {/* Display position — models with physical display adjustment */}
+      {defaultWearable && features?.display?.position && (
         <RouteButton
           icon={<Icon name="locate" size={24} color={theme.colors.secondary_foreground} />}
           label={translate("settings:positionSettings")}
@@ -180,8 +182,8 @@ export function DeviceSettingsSection() {
         />
       )}
 
-      {/* Glasses Menu — G2 only, requires connection */}
-      {defaultWearable === DeviceTypes.G2 && glassesConnected && (
+      {/* Glasses Menu — G2 dashboard / S3 Watch PWR menu */}
+      {(defaultWearable === DeviceTypes.G2 || defaultWearable === DeviceTypes.S3_WATCH) && glassesConnected && (
         <RouteButton
           icon={<Icon name="menu-2" size={24} color={theme.colors.secondary_foreground} />}
           label={translate("settings:glassesMenu")}
@@ -208,9 +210,8 @@ export function DeviceSettingsSection() {
       )}
 
       {/* Button Settings — Mentra Live only (G2's button is a touchpad and conflicts with the native menu).
-          Hidden for now: the action button always launches the camera. ButtonActions.tsx already forces
-          `default_button_action_app` to com.mentra.camera at runtime for any Mentra Live (camera) glasses, so
-          there's nothing for the user to configure. Re-enable this block if we ship a real button-config UX. */}
+          Hidden: button subscriptions control native capture, without launching Gallery.
+          Re-enable this block if we ship a real button-config UX. */}
       {/* {glassesConnected && defaultWearable === DeviceTypes.LIVE && (
         <ButtonSettings
           enabled={defaultButtonActionEnabled}
@@ -227,6 +228,14 @@ export function DeviceSettingsSection() {
         label={translate("deviceSettings:microphone")}
         onPress={() => push("/miniapps/settings/microphone")}
       />
+
+      {superMode && isMentraLive && (
+        <RouteButton
+          label="Wear Detection"
+          subtitle="Tune the don/doff vote window (cs_weartun)."
+          onPress={() => push("/miniapps/settings/wear-tuning")}
+        />
+      )}
 
       {/* WiFi — connected glasses that support WiFi */}
       {showAr99OtaEntry && (
@@ -251,7 +260,9 @@ export function DeviceSettingsSection() {
       )}
 
       {/* OTA Progress — OTA-capable glasses in super mode */}
-      {superMode && glassesConnected && features?.hasOta && otaProgress?.progress && otaProgress?.progress < 100 && <OtaProgressSection otaProgress={otaProgress} />}
+      {superMode && glassesConnected && features?.hasOta && otaProgress?.progress && otaProgress?.progress < 100 && (
+        <OtaProgressSection otaProgress={otaProgress} />
+      )}
 
       {/* Nex Developer Settings — Mentra Display only */}
       {defaultWearable && defaultWearable.includes(DeviceTypes.NEX) && (
@@ -289,18 +300,10 @@ export function DeviceSettingsSection() {
         />
       )}
 
-      {/* Pair controller — super mode */}
-      {superMode && (
-        <RouteButton
-          icon={<Icon name="bluetooth" size={24} color={theme.colors.secondary_foreground} />}
-          label={translate("deviceSettings:pairController")}
-          onPress={() => push("/pairing/select-controller")}
-        />
-      )}
+      {pairControllerButton}
 
       {/* a bit more space to scroll */}
       <Spacer height={theme.spacing.s2} />
     </View>
   )
 }
-

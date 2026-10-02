@@ -100,6 +100,47 @@ test("retries App Store Connect reads terminated while consuming the response bo
   assert.equal(requests, 2)
 })
 
+test("retries a spurious App Store Connect 401 on reads with a freshly signed token", async () => {
+  const unauthorized = response(401, {errors: [{title: "Authentication credentials are missing or invalid."}]})
+  const responses = [unauthorized, response(200, {data: {id: "app-1", attributes: {bundleId: "com.mentra.example"}}})]
+  const tokens = []
+  const api = createAppStoreConnectClient({
+    issuerId: "issuer",
+    keyId: "key",
+    privateKey: TEST_PRIVATE_KEY,
+    delay: 0,
+    sleep: async () => {},
+    fetchImpl: async (_url, options) => {
+      tokens.push(options.headers.Authorization)
+      return responses.shift()
+    },
+  })
+
+  const app = await findApp(api, "com.mentra.example", "app-1")
+  assert.equal(app.id, "app-1")
+  assert.equal(tokens.length, 2)
+  assert.notEqual(tokens[0], tokens[1])
+})
+
+test("a persistent App Store Connect 401 still fails after the retry budget", async () => {
+  let requests = 0
+  const api = createAppStoreConnectClient({
+    issuerId: "issuer",
+    keyId: "key",
+    privateKey: TEST_PRIVATE_KEY,
+    attempts: 3,
+    delay: 0,
+    sleep: async () => {},
+    fetchImpl: async () => {
+      requests += 1
+      return response(401, {errors: [{title: "Authentication credentials are missing or invalid."}]})
+    },
+  })
+
+  await assert.rejects(() => findApp(api, "com.mentra.example", "app-1"), /failed with HTTP 401/)
+  assert.equal(requests, 3)
+})
+
 test("does not retry permanent App Store Connect request failures", async () => {
   let requests = 0
   const api = createAppStoreConnectClient({
@@ -170,8 +211,12 @@ test("inventories the current public App Store build and maximum allocated build
   const api = client([
     {
       data: [
-        {id: "build-20", attributes: {version: "20"}},
-        {id: "build-19", attributes: {version: "19"}},
+        {id: "build-20", attributes: {version: "20"}, relationships: {preReleaseVersion: {data: {id: "pre-31"}}}},
+        {id: "build-19", attributes: {version: "19"}, relationships: {preReleaseVersion: {data: {id: "pre-30"}}}},
+      ],
+      included: [
+        {type: "preReleaseVersions", id: "pre-30", attributes: {version: "3.0.0"}},
+        {type: "preReleaseVersions", id: "pre-31", attributes: {version: "3.1.0"}},
       ],
       links: {next: null},
     },
@@ -189,6 +234,11 @@ test("inventories the current public App Store build and maximum allocated build
     app: {id: "app-1", attributes: {bundleId: "com.mentra.mentra"}},
   })
   assert.equal(inventory.maxBuildNumber, 20)
+  assert.deepEqual(inventory.builds, [
+    {buildNumber: 19, marketingVersion: "3.0.0"},
+    {buildNumber: 20, marketingVersion: "3.1.0"},
+  ])
+  assert.match(api.calls[0].resource, /include=preReleaseVersion/)
   assert.deepEqual(inventory.current, {
     versionId: "version-30",
     buildId: "build-19",
@@ -209,6 +259,7 @@ test("allows a new App Store app with no public version", async () => {
   })
   assert.equal(inventory.current, null)
   assert.equal(inventory.maxBuildNumber, 0)
+  assert.deepEqual(inventory.builds, [])
 })
 
 test("can scope an exact build number to its marketing version", async () => {
@@ -736,6 +787,29 @@ test("recognizes the exact build after App Store submission", async () => {
   })
   assert.equal(status.promoted, true)
   assert.equal(status.state, "WAITING_FOR_REVIEW")
+  // Versions are listed through the app; the top-level collection answers 403.
+  assert.match(api.calls[0].resource, /^\/v1\/apps\/app-1\/appStoreVersions\?/)
+  assert.match(api.calls[0].resource, /filter%5BversionString%5D=3\.1\.0/)
+  assert.doesNotMatch(api.calls[0].resource, /filter%5Bapp%5D/)
+})
+
+test("reports an editable version attached to an earlier build as not yet promoted", async () => {
+  const api = client([
+    {data: [{id: "version-1", attributes: {appStoreState: "REJECTED"}}]},
+    {data: {type: "builds", id: "build-old"}},
+  ])
+  const status = await productionSubmissionStatus(api, {appId: "app-1", versionString: "3.1.1", buildId: "build-new"})
+  assert.equal(status.promoted, false)
+  assert.equal(status.state, "REJECTED")
+  assert.equal(status.attachedBuildId, "build-old")
+  const submitted = client([
+    {data: [{id: "version-1", attributes: {appStoreState: "IN_REVIEW"}}]},
+    {data: {type: "builds", id: "build-old"}},
+  ])
+  await assert.rejects(
+    productionSubmissionStatus(submitted, {appId: "app-1", versionString: "3.1.1", buildId: "build-new"}),
+    /attached to build build-old, not build-new/,
+  )
 })
 
 test("recognizes a build that App Store Connect is processing for distribution", async () => {

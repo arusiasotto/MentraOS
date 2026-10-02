@@ -33,6 +33,32 @@ public interface IHardwareManager {
      */
     boolean supportsRecordingLed();
 
+    /**
+     * Acquire shared ownership of the recording/privacy LED. The LED remains on until every owner
+     * releases it.
+     *
+     * @param owner identity token for one camera user
+     * @return false if the LED is unsupported or enabling it failed; no owner is retained on failure
+     */
+    boolean acquireRecordingLed(Object owner);
+
+    /**
+     * Release shared ownership of the recording/privacy LED.
+     *
+     * @param owner the same identity token passed to {@link #acquireRecordingLed(Object)}
+     */
+    void releaseRecordingLed(Object owner);
+
+    /**
+     * Request RGB OFF once every recording/privacy LED owner has released its lease.
+     * Call before releasing the last photo feedback lease so a camera still capturing can
+     * retain the indicator and complete the pending OFF when it subsequently releases.
+     */
+    void setRgbLedOffWhenRecordingIdle();
+
+    /** Logical privacy ownership, independent of delayed hardware OFF execution. */
+    default boolean isRecordingLedOwned() { return isRecordingLedOn(); }
+
     /** Turn the recording LED on (solid) */
     void setRecordingLedOn();
 
@@ -87,6 +113,10 @@ public interface IHardwareManager {
      * @return true if audio playback helpers are available.
      */
     boolean supportsAudioPlayback();
+
+    /** Queue camera audio readiness without preparing or playing a sound. */
+    default void prepareCameraAudioPlayback() {}
+
 
     /**
      * Play an audio asset routed through the device-specific audio path (e.g. I2S).
@@ -223,6 +253,17 @@ public interface IHardwareManager {
      * Capability#MCU_BATTERY} is not supported.
      */
     void notifyBatteryReading(int percent, int voltageMv);
+
+    /** Receive device-reported active charging, timestamped at UART receipt (elapsed realtime). */
+    default void notifyBatteryReading(
+            int percent, int voltageMv, boolean activeCharging, long receivedAtElapsedMs) {
+        notifyBatteryReading(percent, voltageMv);
+    }
+
+    /** Grant only a known above-floor battery sample with fresh, verified active charging. */
+    default boolean allowsLowBatteryCamera(int batteryLevel) {
+        return false;
+    }
 
     // ============================================
     // MTK LED Brightness Control

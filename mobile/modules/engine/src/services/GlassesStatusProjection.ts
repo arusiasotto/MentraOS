@@ -14,6 +14,35 @@
 import BluetoothSdk, {type PublicGlassesStatus} from "@mentra/bluetooth-sdk"
 import {useCoreStore} from "../stores/core"
 import {useGlassesStore} from "../stores/glasses"
+import {isGlassesConnected} from "./GlassesReadiness"
+import {otaDeviceSessionRevision, startOtaDeviceSession, stopOtaDeviceSession} from "./OtaDeviceSession"
+
+/** Miniapp `session.glasses.onConnection` payload. */
+export type MiniappConnectionData = {
+  connected: boolean
+  modelName?: string
+}
+
+/**
+ * Native `glasses_status` is a store delta (`connection.state`, battery, wifi…).
+ * Miniapps subscribe to a boolean `connected` field. Forwarding the raw status
+ * makes `Boolean(data.connected)` false on every heartbeat while the Mentra App
+ * still shows the glasses linked.
+ */
+export function toMiniappConnectionData(status: unknown): MiniappConnectionData | null {
+  if (!status || typeof status !== "object") return null
+  const rec = status as Partial<PublicGlassesStatus> & {connected?: boolean; modelName?: string}
+  if (typeof rec.connected === "boolean") {
+    const modelName = rec.modelName || rec.deviceModel
+    return {connected: rec.connected, ...(modelName ? {modelName} : {})}
+  }
+  if (!rec.connection) return null
+  const modelName = rec.deviceModel
+  return {
+    connected: isGlassesConnected(rec.connection),
+    ...(modelName ? {modelName} : {}),
+  }
+}
 
 let unsubs: Array<() => void> = []
 let projectionRunId = 0
@@ -27,8 +56,9 @@ export function startGlassesStatusProjection(
   if (unsubs.length) return hydrationPromise ?? Promise.resolve()
 
   const runId = ++projectionRunId
+  const deviceHydration = startOtaDeviceSession()
   let bluetoothEventSeen = false
-  let glassesEventSeen = false
+  let glassesEventRevision: number | null = null
 
   const bluetoothHydration = BluetoothSdk.getBluetoothStatus()
     .then((status) => {
@@ -37,15 +67,6 @@ export function startGlassesStatusProjection(
     })
     .catch((error) => {
       console.warn("GlassesStatusProjection: getBluetoothStatus failed", error)
-    })
-
-  const glassesHydration = BluetoothSdk.getGlassesStatus()
-    .then((status) => {
-      if (runId !== projectionRunId || glassesEventSeen) return
-      useGlassesStore.getState().setGlassesInfo(status)
-    })
-    .catch((error) => {
-      console.warn("GlassesStatusProjection: getGlassesStatus failed", error)
     })
 
   // Bluetooth-adapter status -> core store.
@@ -60,7 +81,7 @@ export function startGlassesStatusProjection(
   // miniapps; clear any stale OTA-available flag on disconnect).
   unsubs.push(
     BluetoothSdk.subscribeGlassesStatus((changed) => {
-      glassesEventSeen = true
+      glassesEventRevision = otaDeviceSessionRevision()
       useGlassesStore.getState().setGlassesInfo(changed)
       glassesStatusForwarder?.(changed)
       if (changed.connection?.state === "disconnected") {
@@ -69,12 +90,29 @@ export function startGlassesStatusProjection(
     }),
   )
 
-  hydrationPromise = Promise.allSettled([bluetoothHydration, glassesHydration]).then(() => undefined)
+  const glassesHydration = (async () => {
+    // A restart may discover a different pair. Establish its ownership before
+    // requesting status, then refetch if another pair replaces that snapshot.
+    await deviceHydration
+    while (runId === projectionRunId) {
+      const deviceRevision = otaDeviceSessionRevision()
+      const status = await BluetoothSdk.getGlassesStatus()
+      if (runId !== projectionRunId) return
+      if (deviceRevision !== otaDeviceSessionRevision()) continue
+      if (glassesEventRevision !== deviceRevision) useGlassesStore.getState().setGlassesInfo(status)
+      return
+    }
+  })().catch((error) => {
+    console.warn("GlassesStatusProjection: getGlassesStatus failed", error)
+  })
+
+  hydrationPromise = Promise.allSettled([deviceHydration, bluetoothHydration, glassesHydration]).then(() => undefined)
   return hydrationPromise
 }
 
 export function stopGlassesStatusProjection(): void {
   projectionRunId++
+  stopOtaDeviceSession()
   unsubs.forEach((unsub) => unsub())
   unsubs = []
   glassesStatusForwarder = null

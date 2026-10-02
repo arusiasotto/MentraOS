@@ -113,11 +113,11 @@ jobs:
   ios:
     name: Publish React Native example to TestFlight
     needs: preflight
-    runs-on: [self-hosted, macOS, ARM64]
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.2.app/Contents/Developer
+    # Each hosted job owns its signing state and artifact transfer.
+    runs-on: macos-15
     timeout-minutes: 90
-    concurrency:
-      group: mentra-ios-signing-runner
-      cancel-in-progress: false
     outputs:
       upload_artifact: ${{ steps.coordinates.outputs.upload_artifact }}
       upload_status: ${{ steps.app-store.outputs.exists == 'true' && 'reused' || 'published' }}
@@ -153,9 +153,9 @@ jobs:
           [[ "$(jq -er .releaseIdentity "$starter")" == "$release_identity" ]]
           [[ "$(jq -er .mentraos.sourceCommit "$starter")" == "$source_commit" ]]
           release_commit=$(jq -er '.starterKit.releaseCommit | select(test("^[0-9a-f]{40}$"))' "$starter")
-          expected_group=$(jq -er 'if .channel == "dev" then "Mentra Dev" elif .channel == "beta" then "Mentra Staging Public" elif .channel == "production" then "Mentra SDK Example Production Candidates" else error("unsupported channel") end' "$plan")
+          expected_group=$(jq -er 'if .channel == "dev" then "Mentra Dev" elif .channel == "beta" then "Mentra Staging Public" elif .channel == "production" then "Mentra Bluetooth Example" else error("unsupported channel") end' "$plan")
           [[ "$TESTFLIGHT_GROUP" == "$expected_group" ]]
-          expected_audience=$(jq -er 'if .channel == "beta" then "external" else "internal" end' "$plan")
+          expected_audience=$(jq -er 'if .channel == "dev" then "internal" else "external" end' "$plan")
           [[ "${{ inputs.testflight_audience }}" == "$expected_audience" ]]
           channel=$(jq -er .channel "$plan")
           build_number=$(jq -er .native.buildNumber "$plan")
@@ -233,14 +233,17 @@ jobs:
           token: ${{ steps.starter-kit-app-token.outputs.token || secrets.STARTER_KIT_COORDINATOR_TOKEN || secrets.MENTRA_BLUETOOTH_SDK_IOS_PUSH_TOKEN }}
           path: starter-kit
 
-      - name: Add runner-managed tools to PATH
+      - name: Set up Ruby signing tools
         if: steps.app-store.outputs.exists != 'true'
-        run: |
-          {
-            echo "$HOME/.rbenv/shims"
-            echo "$HOME/.rbenv/bin"
-            echo "$HOME/.bun/bin"
-          } >> "$GITHUB_PATH"
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: mobile
+
+      - name: Install CocoaPods for the selected Ruby
+        if: steps.app-store.outputs.exists != 'true'
+        run: gem install cocoapods --version 1.16.2 --no-document
 
       - uses: oven-sh/setup-bun@v2
         if: steps.app-store.outputs.exists != 'true'
@@ -303,7 +306,6 @@ jobs:
           ASC_ISSUER_ID: ${{ secrets.ASC_API_ISSUER_ID }}
         run: |
           set -euo pipefail
-          export PATH="$HOME/.rbenv/shims:$HOME/.rbenv/bin:$PATH"
           previous_keychains="${RUNNER_TEMP}/mentra-example-previous-keychains-${GITHUB_RUN_ID}.txt"
           previous_default="${RUNNER_TEMP}/mentra-example-previous-default-keychain-${GITHUB_RUN_ID}.txt"
           security list-keychains -d user \
@@ -318,9 +320,9 @@ jobs:
           } >> "$GITHUB_ENV"
           MATCH_GIT_BASIC_AUTHORIZATION="$(printf '%s' "$RAW_MATCH_GIT_BASIC_AUTHORIZATION" | tr -d '\r\n')"
           export MATCH_GIT_BASIC_AUTHORIZATION
-          bundle install
           keychain="mentra-example-${GITHUB_RUN_ID}.keychain-db"
           password="$(openssl rand -hex 32)"
+          echo "::add-mask::$password"
           security delete-keychain "$keychain" 2>/dev/null || true
           security create-keychain -p "$password" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
@@ -398,6 +400,9 @@ jobs:
           archive="$RUNNER_TEMP/mentra-example-react-native.xcarchive"
           output="$RUNNER_TEMP/mentra-example-react-native-export"
           rm -rf "$archive" "$output"
+          BUNDLE_GEMFILE="$GITHUB_WORKSPACE/mobile/Gemfile" bundle exec ruby \
+            "$GITHUB_WORKSPACE/.github/scripts/configure-example-ios-signing.rb" \
+            ios/MentraSDKRN.xcodeproj
           xcodebuild \
             -workspace "$workspace" \
             -scheme "$scheme" \
@@ -409,9 +414,6 @@ jobs:
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="$MENTRA_CI_CODE_SIGN_IDENTITY" \
-            PROVISIONING_PROFILE_SPECIFIER="$MENTRA_CI_PROVISIONING_PROFILE_NAME" \
             OTHER_CODE_SIGN_FLAGS="--keychain $MENTRA_CI_KEYCHAIN" \
             MARKETING_VERSION="$MARKETING_VERSION" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
@@ -490,14 +492,51 @@ jobs:
           echo "${{ steps.app-store.outputs.exists == 'true' && 'reused' || 'published' }}" \
             > release-output/upload-status.txt
 
-      - uses: actions/upload-artifact@v4
+      # Keep retries in the workflow: the frozen source checkout may predate this policy.
+      - name: Upload IPA handoff (attempt 1 of 3)
+        id: ipa-upload-1
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.coordinates.outputs.upload_artifact }}
           path: release-output
           if-no-files-found: error
           retention-days: 90
 
-      - name: Clean persistent-runner credentials
+      - name: Wait before IPA upload attempt 2
+        if: steps.ipa-upload-1.outcome == 'failure'
+        run: sleep 10
+
+      - name: Upload IPA handoff (attempt 2 of 3)
+        id: ipa-upload-2
+        if: steps.ipa-upload-1.outcome == 'failure'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.coordinates.outputs.upload_artifact }}
+          path: release-output
+          if-no-files-found: error
+          retention-days: 90
+          # A failed response can leave an intermediate artifact behind.
+          overwrite: true
+
+      - name: Wait before IPA upload attempt 3
+        if: steps.ipa-upload-2.outcome == 'failure'
+        run: sleep 10
+
+      - name: Upload IPA handoff (attempt 3 of 3)
+        id: ipa-upload-3
+        if: steps.ipa-upload-2.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.coordinates.outputs.upload_artifact }}
+          path: release-output
+          if-no-files-found: error
+          retention-days: 90
+          # A failed response can leave an intermediate artifact behind.
+          overwrite: true
+
+      - name: Clean signing credentials
         if: always()
         run: |
           if [[ -n "${MENTRA_CI_KEYCHAIN:-}" ]]; then
@@ -540,6 +579,18 @@ jobs:
         with:
           ref: ${{ inputs.source_commit }}
 
+      # The publication record is written by the workflow revision's script,
+      # not the frozen source's: a production example is built from a promoted
+      # beta commit whose copy may predate the production destination. On dev
+      # and staging the two revisions are the same commit.
+      - name: Checkout example tooling from the workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: release-tooling
+          sparse-checkout: .github/scripts
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.release_plan_artifact }}
@@ -569,9 +620,9 @@ jobs:
           [[ "$(jq -er .releaseSetId "$starter")" == "$release_set_id" ]]
           [[ "$(jq -er .releaseIdentity "$starter")" == "$release_identity" ]]
           [[ "$(jq -er .mentraos.sourceCommit "$starter")" == "$(jq -er .sourceCommit "$plan")" ]]
-          expected_group=$(jq -er 'if .channel == "dev" then "Mentra Dev" elif .channel == "beta" then "Mentra Staging Public" elif .channel == "production" then "Mentra SDK Example Production Candidates" else error("unsupported channel") end' "$plan")
+          expected_group=$(jq -er 'if .channel == "dev" then "Mentra Dev" elif .channel == "beta" then "Mentra Staging Public" elif .channel == "production" then "Mentra Bluetooth Example" else error("unsupported channel") end' "$plan")
           [[ "$TESTFLIGHT_GROUP" == "$expected_group" ]]
-          expected_audience=$(jq -er 'if .channel == "beta" then "external" else "internal" end' "$plan")
+          expected_audience=$(jq -er 'if .channel == "dev" then "internal" else "external" end' "$plan")
           [[ "${{ inputs.testflight_audience }}" == "$expected_audience" ]]
           channel=$(jq -er .channel "$plan")
           build_number=$(jq -er .native.buildNumber "$plan")
@@ -663,7 +714,7 @@ jobs:
             review_state="${{ steps.assignment.outputs.review_state }}"
           fi
           mkdir -p release-output
-          node .github/scripts/coordinated-example-testflight-record.mjs \
+          node release-tooling/.github/scripts/coordinated-example-testflight-record.mjs \
             --plan release-input/plan/release-plan.json \
             --starter-kit "${{ steps.coordinates.outputs.starter_result }}" \
             --app-id "$app_id" \

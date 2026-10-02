@@ -3,6 +3,9 @@ import { z } from "zod";
 import { adminAuth } from "../middleware/admin-auth.middleware";
 import adminReports from "./reports.api";
 import adminSupportProfiles from "./support-profiles.api";
+import adminTestRuns from "./test-runs.api";
+import adminTestDispatches from "./test-dispatches.api";
+import adminFixFlows from "./fix-flows.api";
 import {
   PREINSTALLED_INSTALL_POLICIES,
 } from "../../models/preinstalled-registry-revision.model";
@@ -72,6 +75,9 @@ app.get("/audit-log", getAuditLog);
 // gate above keeps auth to a single pass per request.
 app.route("/reports", adminReports);
 app.route("/support-profiles", adminSupportProfiles);
+app.route("/test-runs", adminTestRuns);
+app.route("/fix-flows", adminFixFlows);
+app.route("/", adminTestDispatches);
 
 async function getSubmissions(c: AppContext) {
   return c.json({ submissions: await miniapps.listAdminSubmissions() });

@@ -3,7 +3,7 @@ package com.mentra.bluetoothsdk.debug
 import android.content.Context
 import android.os.Build
 import android.os.Process
-import android.util.Log
+import com.mentra.bluetoothsdk.utils.NativeLog as Log
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -108,6 +108,9 @@ object BleTraceLogger {
     }
 
     private fun sanitizeValue(key: String?, value: Any?): Any? {
+        // Scan security metadata is a boolean, not a credential. Keep the exact
+        // typed field while still redacting string/unknown values under this key.
+        if (key == "requiresPassword" && value is Boolean) return value
         if (key != null && sensitiveKeyParts.any { key.contains(it, ignoreCase = true) }) {
             return "<redacted>"
         }

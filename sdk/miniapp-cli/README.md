@@ -10,7 +10,7 @@ mentra-miniapp <command>
 
 | Command                                           | What it does                                                              |
 | ------------------------------------------------- | ------------------------------------------------------------------------- |
-| [`dev`](#dev)                                     | Starts the dev server with hot reload, prints a QR to load it on a phone  |
+| [`dev`](#dev)                                     | Starts the dev server (hot reload unless `--no-hot-reload`), prints a QR to load it on a phone  |
 | [`release`](#release)                             | Builds, packs, and serves a QR to install the release on a phone over LAN |
 | [`pack`](#pack)                                   | Validates the manifest and zips `dist/` into `<pkg>-<version>.zip`        |
 | [`manifest`](#manifest)                           | Interactive top-level wizard for editing `miniapp.json`                   |
@@ -26,6 +26,9 @@ Run with no args to print the same usage table.
 
 ```bash
 mentra-miniapp dev
+mentra-miniapp dev --no-hot-reload          # serve + logs only; no remount on save
+mentra-miniapp dev --usb                    # reach the phone over USB, no shared Wi-Fi
+mentra-miniapp dev --usb --device <serial>  # pick one of several attached devices
 ```
 
 What it does:
@@ -34,13 +37,13 @@ What it does:
 2. Runs the project's `build.ts` so `dist/background/index.js` and `dist/ui/*` are current.
 3. Picks the first free adjacent port pair starting at `port`: one for static files and the next for the dev sidecar.
 4. Starts a static server that serves `miniapp.json`, `icon.png`, and project files.
-5. Starts a **dev sidecar** on `port + 1` — a WebSocket the phone connects to for live reload + console-log forwarding back to your terminal. Failure here is non-fatal; the miniapp still runs without live reload.
-6. Detects the LAN IP, builds a `miniapp://dev?url=…&name=…&package=…&dev=<sidecarPort>` URL, and prints a terminal QR + the raw URL.
-7. Watches for LAN-IP changes (Wi-Fi switch) every 10s and reprints the QR.
+5. Starts a **dev sidecar** on `port + 1` — a WebSocket the phone connects to for live reload + console-log forwarding back to your terminal. Failure here is non-fatal; the miniapp still runs without live reload. `--no-hot-reload` keeps the log bridge and `bundle.zip` endpoint but skips the filesystem watcher, so saves no longer remount the WebView or respawn the background JSContext.
+6. Detects the LAN IP (or sets up USB tunnels with `--usb`), builds a `miniapp://dev?url=…&name=…&package=…&dev=<sidecarPort>` URL, and prints a terminal QR + the raw URL.
+7. Watches for LAN-IP changes (Wi-Fi switch) every 2s and reprints the QR. Skipped under `--usb`, where the QR host is a fixed loopback address.
 
 Default `port` is `3000`; override the starting point with a `"port": <n>` field in `miniapp.json`. If that port or its sidecar neighbor is busy, `dev` scans upward until it finds a free adjacent pair.
 
-**On the phone:** open the Mentra App → **Settings → Developer settings → Mini App Development → Scan Mini App QR Code**. Phone and laptop must be on the same Wi-Fi.
+**On the phone:** open the Mentra App → **Settings → Developer settings → Mini App Development → Scan Mini App QR Code**. Phone and laptop must be on the same Wi-Fi, unless you use `--usb` (below).
 
 `dev` is live and temporary. Keep the CLI and computer running because the
 Mentra App loads the runtime bundle from that LAN server. Dev miniapps are keyed
@@ -49,7 +52,33 @@ rescanning the same package updates only that entry. The Mentra App caches each
 entry's name and icon. Use `bun run release` when you need an installed miniapp
 that works without the computer.
 
-`Ctrl+C` stops the server, the sidecar, and the IP watcher.
+`Ctrl+C` stops the server, the sidecar, the IP watcher, and any USB tunnels.
+
+### `--usb` — no shared Wi-Fi required
+
+`--usb` runs `adb reverse` for the static port and the sidecar port, which
+publishes them on the phone's own loopback address over the USB cable. The QR
+then advertises `http://127.0.0.1:<port>` instead of a LAN IP, so the phone and
+the laptop no longer need to share a network. This is the fix when you're on
+guest Wi-Fi, on a network with AP client isolation, or on no Wi-Fi at all.
+
+Everything else behaves the same: live reload and console forwarding ride the
+same tunnel, and the QR still carries the mDNS hint as a fallback.
+
+Notes:
+
+- **Android only.** iOS has no `adb`, so `--usb` can't work there.
+- Requires `adb` on `PATH` (Android platform-tools) and USB debugging accepted
+  on the device.
+- With several devices attached, `dev` refuses to guess and lists the serials —
+  pass `--device <serial>`. Mentra Live glasses (`0123456789ABCDEF`) are skipped
+  automatically so a phone + glasses pair does not need `--device`.
+- If the tunnel can't be established, `dev` falls back to the LAN address and
+  says so. With no LAN address either, it exits.
+- Reverse mappings die on unplug, on `adb kill-server`, and on device reboot.
+  `dev` re-checks every 5s and re-asserts them, logging only the transitions.
+- Teardown removes only the ports it opened, so a Metro `tcp:8081` mapping you
+  set up separately survives.
 
 ---
 
@@ -219,3 +248,60 @@ The CLI's allowed-value lists are mirrored by hand from `@mentra/engine` and `@m
 - Dev sidecar WebSocket server: `src/dev-server.ts`
 - QR rendering: `src/qr.ts`
 - Generated JSON Schema: `schema/miniapp.schema.json` (regenerated via `schema regenerate`)
+
+## Try a packed miniapp during routine authoring
+
+With the Mentra App already signed in and its existing **Super Mode** enabled, build and pack the modified miniapp normally.
+For a fresh local authoring build, set `EXPO_PUBLIC_SUPER_MODE=true` when building
+the Mentra App. This defaults the existing setting on without UI clicks; normal
+builds default it off. An explicitly saved setting still takes precedence. This
+is a local build option, not a change to the requested CI artifact.
+
+From the MentraOS checkout, load the resulting ZIP without navigating developer settings:
+
+```bash
+MENTRA_MAC_APP=/absolute/path/Mentra.app bun scripts/load-authoring-miniapp.mjs /absolute/path/com.mentra.notes-1.0.27.zip --mac
+bun scripts/load-authoring-miniapp.mjs /absolute/path/com.mentra.notes-1.0.27.zip --android R5CW22Z3GDZ
+```
+
+The command serves only that ZIP on loopback; Android uses an owned `adb reverse`
+tunnel. It sends `com.mentra://test/load-miniapp?url=...&package=...&version=...`.
+The app validates the ZIP into an isolated dev snapshot using the existing
+installer, checks deployment authorization and existing permissions, then stops
+and opens the named miniapp through
+the normal miniapp lifecycle. No Mentra App rebuild, sign-out or routine restart is
+needed after installing a host build that includes this handler. New permissions
+must already be granted. This does not change production bundles or routine replay
+configuration. Repacking the same version creates a fresh dev snapshot and UI;
+managed release files stay intact. Failed replacement restores the previous
+selection and running state.
+
+Keep the command running until the app opens the miniapp, then press Ctrl+C to
+stop its server and remove its USB tunnel. App logs emit `MINIAPP_LOAD_RESULT`
+with `opened` or `failed`; URL delivery alone does not prove installation or UI
+readiness. Verify the changed step in the held authoring session.
+
+Incident submission uses the same cross-platform transport:
+
+```bash
+MENTRA_MAC_APP=/absolute/path/Mentra.app bun scripts/submit-test-incident.mjs --mac alert_id=authoring-1 failure_code=search_failed 'failure_message=Search did not filter the notes'
+bun scripts/submit-test-incident.mjs --android R5CW22Z3GDZ alert_id=authoring-2 failure_code=search_failed 'failure_message=Search did not filter the notes'
+```
+
+Both send `com.mentra://test/submit-incident-report`. The existing incident modal
+keeps the current screen underneath and shows upload status and the report ID.
+The packed snapshot becomes the selected source, even if this package previously
+used a scanned development server. A later scan selects that server again. Failed
+replacement restores the previous source.
+
+For an Android build variant, set `MENTRA_HOST_PACKAGE` to its exact application
+ID (for example `com.mentra.mentra.china`) when running either script. The default
+is `com.mentra.mentra`.
+
+For Mac, both scripts require `MENTRA_MAC_APP` to identify the exact installed
+`.app`, so another Mentra App build cannot receive the URL by mistake. The live
+word monitor accepts the Android variant through `--app-package`.
+
+Both script entry points require Super Mode. The old Android incident broadcast
+has been removed; automated-testing callers use this shared URL. Normal user
+feedback remains available without Super Mode.

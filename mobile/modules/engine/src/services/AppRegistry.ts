@@ -13,63 +13,43 @@
  *   - uninstall(packageName, version?)      remove one or all versions
  *   - getInstalledMiniapps()                ClientApp[] derived from disk
  *   - getActiveVersion(packageName)         active version string for a package
+ *   - getLatestDevSnapshotVersion(pkg)      newest on-disk `dev-*` snapshot
  *   - getBundleDir / getMiniappManifest     filesystem helpers used by hosts
  *   - subscribe(fn)                         register a refresh listener
  */
 
 import {Directory, Paths, File} from "expo-file-system"
 import {unzip} from "react-native-zip-archive"
+import {createMMKV, type MMKV} from "react-native-mmkv"
 import semver from "semver"
 import {AsyncResult, Result, result as Res} from "typesafe-ts"
 
-import type {AppletPermission, AppPermissionType, AppletType, ClientApp} from "../types/applet"
+import type {AppletType, ClientApp} from "../types/applet"
 import {HardwareRequirement, HardwareRequirementLevel, HardwareType} from "../types"
 import {configuredDevHost} from "../utils/configuredDevHost"
 import {storage} from "../utils/storage/storage"
 import {printDirectory} from "../utils/storage/zip"
+import {isDevMiniappAllowed, isInstalledMiniappAllowed, isOfflineSystemMiniappAllowed} from "../runtime/bootstrap"
+import {SETTINGS, useSettingsStore} from "../stores/settings"
 import {checkManifestVersions} from "./manifestVersionGate"
 import {normalizeManifestActions} from "./manifestActions"
+import {normalizeManifestPermissions} from "./manifestPermissions"
+import {miniappInstallIdentityError, type MiniappInstallExpectations} from "./miniappInstallIdentity"
 import {miniappRunningRegistry} from "./MiniappRunningRegistry"
+import {sameMiniappBundle} from "./sameMiniappBundle"
 
 export {normalizeManifestActions} from "./manifestActions"
+export {normalizeManifestPermissions} from "./manifestPermissions"
 
-const ALLOWED_PERMISSION_TYPES: ReadonlySet<AppPermissionType> = new Set<AppPermissionType>([
-  "MICROPHONE",
-  "CAMERA",
-  "CALENDAR",
-  "LOCATION",
-  "BACKGROUND_LOCATION",
-  "READ_NOTIFICATIONS",
-  "POST_NOTIFICATIONS",
-])
+let installQueue: Promise<void> = Promise.resolve()
 
-/**
- * Normalize the `permissions` field from a miniapp.json manifest.
- *
- * New miniapps ship `[{type, required?, description?}]` objects. A few older
- * installed bundles may have `["MICROPHONE", ...]` plain strings. Accept both.
- */
-export function normalizeManifestPermissions(
-  raw: Array<string | {type: string; required?: boolean; description?: string}> | undefined,
-): AppletPermission[] {
-  if (!Array.isArray(raw)) return []
-  const out: AppletPermission[] = []
-  for (const p of raw) {
-    if (typeof p === "string") {
-      if (ALLOWED_PERMISSION_TYPES.has(p as AppPermissionType)) {
-        out.push({type: p as AppPermissionType, required: true})
-      }
-    } else if (p && typeof p === "object" && typeof p.type === "string") {
-      if (ALLOWED_PERMISSION_TYPES.has(p.type as AppPermissionType)) {
-        out.push({
-          type: p.type as AppPermissionType,
-          ...(typeof p.required === "boolean" ? {required: p.required} : {}),
-          ...(typeof p.description === "string" ? {description: p.description} : {}),
-        })
-      }
-    }
-  }
-  return out
+function serializeInstall<T>(operation: () => Promise<T>): Promise<T> {
+  const result = installQueue.then(operation, operation)
+  installQueue = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  return result
 }
 
 function normalizeManifestType(raw: unknown): AppletType {
@@ -140,10 +120,12 @@ interface InstalledLma {
 }
 
 export interface MiniappReleaseIdentity {
-  source: "direct_download" | "bundled_asset" | "preinstalled_registry" | "dev_snapshot"
+  source: "direct_download" | "bundled_asset" | "preinstalled_registry" | "deployment_manifest" | "dev_snapshot"
   releaseId?: string
   bundleSha256?: string
   channel?: string
+  deploymentId?: string
+  deploymentOrigin?: string
 }
 
 function releaseIdentityKey(packageName: string, version: string): string {
@@ -208,6 +190,13 @@ async function downloadMiniAppZip(url: string): Promise<string> {
 async function unpackMiniApp(
   zipPath: string,
   versionOverride?: string,
+  expected?: MiniappInstallExpectations,
+  adoptExisting?: (
+    packageName: string,
+    version: string,
+    extracted: Directory,
+    installed: Directory,
+  ) => Promise<boolean>,
 ): Promise<{packageName: string; version: string}> {
   const unzipDir = new Directory(Paths.cache, "lma_unzip")
   try {
@@ -245,6 +234,8 @@ async function unpackMiniApp(
     throw "READ_MANIFEST_FAILED"
   }
   const version = versionOverride ?? manifestVersion
+  const identityError = miniappInstallIdentityError({packageName, version: manifestVersion}, expected)
+  if (identityError) throw new Error(identityError)
   console.log(`ZIP: installing ${packageName} as version ${version}`)
 
   const basePackageDir = new Directory(Paths.document, "lmas", packageName)
@@ -259,6 +250,14 @@ async function unpackMiniApp(
 
   const versionDir = new Directory(basePackageDir, version)
   try {
+    if (expected?.rejectExistingVersion && versionDir.exists) {
+      // The host may adopt a byte-identical bundled release after verifying a
+      // deployment ZIP. Never replace its files or trust a version label alone.
+      if (adoptExisting && (await adoptExisting(packageName, version, appDir, versionDir))) {
+        return {packageName, version}
+      }
+      throw new Error(`Miniapp ${packageName}@${version} is already installed`)
+    }
     if (!versionDir.exists) {
       versionDir.create()
     } else {
@@ -277,6 +276,10 @@ async function unpackMiniApp(
     }
   } catch (error) {
     console.error("Error moving the contents of the folder to the destination directory", error)
+    // With rejectExistingVersion, this invocation created the destination.
+    // Roll back here while the install queue is held, never from a caller's
+    // stale pre-download snapshot of which versions used to exist.
+    if (expected?.rejectExistingVersion && versionDir.exists) versionDir.delete()
     throw "INSTALL_CONTENTS_FAILED"
   }
 
@@ -298,10 +301,11 @@ async function unpackMiniApp(
 async function downloadAndInstallMiniApp(
   url: string,
   versionOverride?: string,
+  expected?: MiniappInstallExpectations,
 ): Promise<{packageName: string; version: string}> {
   const downloadedZipPath = await downloadMiniAppZip(url)
   console.log("ZIP: done downloading, starting unzip")
-  return unpackMiniApp(downloadedZipPath, versionOverride)
+  return unpackMiniApp(downloadedZipPath, versionOverride, expected)
 }
 
 type Listener = () => void
@@ -315,6 +319,36 @@ class AppRegistry {
   private sttModelRequired = new Set<string>()
   private refreshNeeded: boolean = true
   private listeners = new Set<Listener>()
+  private retainedDevVersions = new Map<string, Set<string>>()
+
+  /** Hold the running and rollback bundles while an explicit replacement settles. */
+  public retainDevVersions(packageName: string, versions: string[]): () => void {
+    if (this.retainedDevVersions.has(packageName)) throw new Error("A miniapp replacement is already in progress")
+    this.retainedDevVersions.set(packageName, new Set(versions.filter(version => version.startsWith("dev-"))))
+    return () => {this.retainedDevVersions.delete(packageName)}
+  }
+
+  private protectedDevVersions(packageName: string): Set<string> {
+    const versions = new Set(this.retainedDevVersions.get(packageName))
+    const selected = this.getSelectedDevSnapshot(packageName)
+    if (selected) versions.add(selected)
+    const active = storage.load<string>(`${packageName}_active_version`)
+    if (active.is_ok() && active.value.startsWith("dev-") && miniappRunningRegistry.has(packageName)) versions.add(active.value)
+    return versions
+  }
+  private installationMetadata?: MMKV
+
+  // Bundle files survive logout; their provenance must survive with them.
+  // Keep installation metadata out of the default, session-cleared MMKV store.
+  private get releaseIdentities(): MMKV {
+    return (this.installationMetadata ??= createMMKV({id: "mentra-miniapp-installations"}))
+  }
+
+  private removeReleaseIdentity(packageName: string, version: string): void {
+    const key = releaseIdentityKey(packageName, version)
+    this.releaseIdentities.remove(key)
+    storage.remove(key)
+  }
 
   private static instance: AppRegistry | null = null
 
@@ -444,17 +478,31 @@ class AppRegistry {
    */
   public installFromUrl(
     url: string,
-    opts?: {versionOverride?: string; releaseIdentity?: MiniappReleaseIdentity},
+    opts?: {
+      versionOverride?: string
+      releaseIdentity?: MiniappReleaseIdentity
+      expectedPackageName?: string
+      expectedVersion?: string
+      rejectExistingVersion?: boolean
+    },
   ): AsyncResult<void, Error> {
-    return Res.try_async(async () => {
-      const {packageName, version} = await downloadAndInstallMiniApp(url, opts?.versionOverride)
-      console.log("APP_REGISTRY: Downloaded and installed mini app")
-      this.finalizeInstall(
-        packageName,
-        version,
-        opts?.releaseIdentity ?? {source: version.startsWith("dev-") ? "dev_snapshot" : "direct_download"},
-      )
-    })
+    return Res.try_async(() =>
+      serializeInstall(async () => {
+        if (opts?.expectedPackageName && !opts.versionOverride?.startsWith("dev-") && this.retainedDevVersions.has(opts.expectedPackageName))
+          throw new Error("Cannot install a release during miniapp replacement")
+        const {packageName, version} = await downloadAndInstallMiniApp(url, opts?.versionOverride, {
+          packageName: opts?.expectedPackageName,
+          version: opts?.expectedVersion,
+          rejectExistingVersion: opts?.rejectExistingVersion,
+        })
+        console.log("APP_REGISTRY: Downloaded and installed mini app")
+        this.finalizeInstall(
+          packageName,
+          version,
+          opts?.releaseIdentity ?? {source: version.startsWith("dev-") ? "dev_snapshot" : "direct_download"},
+        )
+      }),
+    )
   }
 
   /**
@@ -466,14 +514,49 @@ class AppRegistry {
    */
   public installFromLocalZip(
     zipPath: string,
-    opts?: {versionOverride?: string; releaseIdentity?: MiniappReleaseIdentity},
+    opts?: {
+      versionOverride?: string
+      releaseIdentity?: MiniappReleaseIdentity
+      expectedPackageName?: string
+      expectedVersion?: string
+      rejectExistingVersion?: boolean
+      /** Host-only migration after the deployment ZIP's digest is verified. */
+      adoptIdenticalInstalledVersion?: boolean
+    },
   ): AsyncResult<{packageName: string; version: string}, Error> {
-    return Res.try_async(async () => {
-      const {packageName, version} = await unpackMiniApp(zipPath, opts?.versionOverride)
-      console.log("APP_REGISTRY: Installed mini app from local zip")
-      this.finalizeInstall(packageName, version, opts?.releaseIdentity ?? {source: "bundled_asset"})
-      return {packageName, version}
-    })
+    return Res.try_async(() =>
+      serializeInstall(async () => {
+        if (opts?.expectedPackageName && !opts.versionOverride?.startsWith("dev-") && this.retainedDevVersions.has(opts.expectedPackageName))
+          throw new Error("Cannot install a release during miniapp replacement")
+        if (
+          opts?.adoptIdenticalInstalledVersion &&
+          (opts.releaseIdentity?.source !== "deployment_manifest" ||
+            !opts.expectedPackageName ||
+            !opts.expectedVersion ||
+            opts.versionOverride ||
+            !opts.rejectExistingVersion)
+        )
+          throw new Error("Bundle adoption requires a verified deployment release with an exact identity")
+        const {packageName, version} = await unpackMiniApp(
+          zipPath,
+          opts?.versionOverride,
+          {
+            packageName: opts?.expectedPackageName,
+            version: opts?.expectedVersion,
+            rejectExistingVersion: opts?.rejectExistingVersion,
+          },
+          opts?.adoptIdenticalInstalledVersion
+            ? async (pkg, ver, extracted, installed) => {
+                const identity = this.getReleaseIdentity(pkg, ver)
+                return identity?.source !== "deployment_manifest" && (await sameMiniappBundle(extracted, installed))
+              }
+            : undefined,
+        )
+        console.log("APP_REGISTRY: Installed mini app from local zip")
+        this.finalizeInstall(packageName, version, opts?.releaseIdentity ?? {source: "bundled_asset"})
+        return {packageName, version}
+      }),
+    )
   }
 
   /**
@@ -493,14 +576,44 @@ class AppRegistry {
     }
 
     this.setActiveVersion(packageName, version)
-    storage.save(releaseIdentityKey(packageName, version), releaseIdentity)
+    this.releaseIdentities.set(releaseIdentityKey(packageName, version), JSON.stringify(releaseIdentity))
     this.refreshNeeded = true
     this.notify()
   }
 
   public getReleaseIdentity(packageName: string, version: string): MiniappReleaseIdentity | null {
-    const result = storage.load<MiniappReleaseIdentity>(releaseIdentityKey(packageName, version))
-    return result.is_ok() ? result.value : null
+    const key = releaseIdentityKey(packageName, version)
+    const stored = this.releaseIdentities.getString(key)
+    if (stored) {
+      try {
+        return JSON.parse(stored) as MiniappReleaseIdentity
+      } catch {
+        return null
+      }
+    }
+    // Migrate pre-upgrade metadata when it still exists. If an older logout
+    // already erased it, verified byte comparison can recover an exact bundle.
+    const legacy = storage.load<MiniappReleaseIdentity>(key)
+    if (legacy.is_error()) return null
+    this.releaseIdentities.set(key, JSON.stringify(legacy.value))
+    storage.remove(key)
+    return legacy.value
+  }
+
+  /** Enumerate installed releases carrying deployment ownership metadata. */
+  public getDeploymentOwnedReleases(): Array<{
+    packageName: string
+    version: string
+    identity: MiniappReleaseIdentity
+  }> {
+    const releases: Array<{packageName: string; version: string; identity: MiniappReleaseIdentity}> = []
+    for (const packageName of this.getPackageNames()) {
+      for (const version of this.getInstalledVersions(packageName)) {
+        const identity = this.getReleaseIdentity(packageName, version)
+        if (identity?.source === "deployment_manifest") releases.push({packageName, version, identity})
+      }
+    }
+    return releases
   }
 
   public installFromJsonUrl(baseUrl: string): AsyncResult<{packageName: string; version: string; name: string}, Error> {
@@ -532,13 +645,14 @@ class AppRegistry {
    * package leaves nothing behind that `projectDevApps` could re-surface.
    */
   private clearDevArtifacts(packageName: string): void {
+    if (this.retainedDevVersions.has(packageName)) throw new Error("Cannot clear a miniapp during replacement")
     try {
       const pkgDir = new Directory(Paths.document, "lmas", packageName)
       if (pkgDir.exists) {
         for (const item of pkgDir.list()) {
           if (item instanceof Directory && item.name.startsWith("dev-")) {
             try {
-              storage.remove(releaseIdentityKey(packageName, item.name))
+              this.removeReleaseIdentity(packageName, item.name)
               item.delete()
             } catch (e) {
               console.warn(`APP_REGISTRY: failed to delete ${item.name}:`, e)
@@ -549,6 +663,7 @@ class AppRegistry {
     } catch (e) {
       console.warn(`APP_REGISTRY: clearDevArtifacts dir scan failed for ${packageName}:`, e)
     }
+    storage.remove(`${packageName}_dev_selected_snapshot`)
     storage.remove(`${packageName}_dev_url`)
     storage.remove(`${packageName}_dev_port`)
     storage.remove(`${packageName}_dev_mdns`)
@@ -574,8 +689,11 @@ class AppRegistry {
         .list()
         .filter((d): d is Directory => d instanceof Directory && d.name.startsWith("dev-"))
         .sort((a, b) => (a.name < b.name ? 1 : -1))
+      const protectedVersions = this.protectedDevVersions(packageName)
       for (let i = keep; i < dirs.length; i++) {
+        if (protectedVersions.has(dirs[i].name)) continue
         try {
+          this.removeReleaseIdentity(packageName, dirs[i].name)
           dirs[i].delete()
         } catch (e) {
           console.warn(`APP_REGISTRY: failed to delete ${dirs[i].name}:`, e)
@@ -587,14 +705,40 @@ class AppRegistry {
     }
   }
 
+  /** An explicitly selected packed snapshot takes precedence over scanned live URLs. */
+  public getSelectedDevSnapshot(packageName: string): string | null {
+    const selected = storage.load<string>(`${packageName}_dev_selected_snapshot`)
+    return selected.is_ok() && selected.value.startsWith("dev-") && this.getInstalledVersions(packageName).includes(selected.value)
+      ? selected.value : null
+  }
+
+  public selectDevSnapshot(packageName: string, version: string | null): void {
+    if (version !== null && (!version.startsWith("dev-") || !this.getInstalledVersions(packageName).includes(version)))
+      throw new Error("Selected dev snapshot is not installed")
+    if (version === null) storage.remove(`${packageName}_dev_selected_snapshot`)
+    else storage.save(`${packageName}_dev_selected_snapshot`, version)
+    this.markRefreshNeeded()
+  }
+
+  /** Remove one failed staged dev replacement without clearing other dev files or settings. */
+  public discardDevSnapshot(packageName: string, version: string): void {
+    if (!/^dev-[0-9a-f-]+$/.test(version)) throw new Error("Expected an owned dev snapshot version")
+    const directory = new Directory(Paths.document, "lmas", packageName, version)
+    if (directory.exists) directory.delete()
+    this.removeReleaseIdentity(packageName, version)
+    this.refreshNeeded = true
+    this.notify()
+  }
+
   public uninstall(packageName: string, version?: string): AsyncResult<void, Error> {
     return Res.try_async(async () => {
+      if (this.retainedDevVersions.has(packageName)) throw new Error("Cannot uninstall a miniapp during replacement")
       if (version) {
         const lmaDir = new Directory(Paths.document, "lmas", packageName, version)
         // Guard exists: a dev miniapp loads over HTTP and has no on-disk dir,
         // so an unconditional delete() would throw and abort the cleanup below.
         if (lmaDir.exists) lmaDir.delete()
-        storage.remove(releaseIdentityKey(packageName, version))
+        this.removeReleaseIdentity(packageName, version)
         console.log("APP_REGISTRY: Uninstalled mini app version", version)
         const packageDir = new Directory(Paths.document, "lmas", packageName)
         if (packageDir.exists && packageDir.list().length === 0) {
@@ -602,7 +746,7 @@ class AppRegistry {
         }
       } else {
         for (const installedVersion of this.getInstalledVersions(packageName)) {
-          storage.remove(releaseIdentityKey(packageName, installedVersion))
+          this.removeReleaseIdentity(packageName, installedVersion)
         }
         const packageDir = new Directory(Paths.document, "lmas", packageName)
         if (packageDir.exists) {
@@ -648,31 +792,74 @@ class AppRegistry {
     }
   }
 
-  public async getActiveVersion(packageName: string): Promise<string> {
+  public async getActiveVersion(packageName: string): Promise<string | undefined> {
     let versions = this.getInstalledVersions(packageName)
+    // A scanned build only stands in for a workspace miniapp while super mode
+    // allows it. Leaving the stored pointer alone lets turning super mode on
+    // bring that scan back; until then the released version stays on screen.
+    const devAllowed = isDevMiniappAllowed(
+      packageName,
+      useSettingsStore.getState().getSetting(SETTINGS.super_mode.key) === true,
+    )
+    const selectedSnapshot = devAllowed ? this.getSelectedDevSnapshot(packageName) : null
+    if (selectedSnapshot) return selectedSnapshot
     // Treat MMKV as a hint, not authority. A stored version may have been
     // GC'd off disk without this pointer being updated.
-    let res = storage.load<string>(`${packageName}_active_version`)
-    if (res.is_ok() && versions.includes(res.value)) {
+    const res = storage.load<string>(`${packageName}_active_version`)
+    if (res.is_ok() && versions.includes(res.value) && (!res.value.startsWith("dev-") || devAllowed)) {
       return res.value
     }
     // Dev versions take precedence over semver-installed versions.
-    const devVersions = versions
-      .filter((v) => v.startsWith("dev-"))
-      .sort()
-      .reverse()
-    if (devVersions.length > 0) {
-      this.setActiveVersion(packageName, devVersions[0])
-      return devVersions[0]
+    if (devAllowed) {
+      const devVersions = versions
+        .filter((v) => v.startsWith("dev-"))
+        .sort()
+        .reverse()
+      if (devVersions.length > 0) {
+        this.setActiveVersion(packageName, devVersions[0])
+        return devVersions[0]
+      }
     }
     versions = versions.filter((v) => semver.valid(v))
     versions.sort((a, b) => semver.rcompare(a, b))
-    this.setActiveVersion(packageName, versions[0])
+    if (!versions.length) return undefined
+    if (!(res.is_ok() && res.value.startsWith("dev-"))) this.setActiveVersion(packageName, versions[0])
     return versions[0]
   }
 
   public setActiveVersion(packageName: string, version: string): Result<void, Error> {
-    return storage.save(`${packageName}_active_version`, version)
+    const key = `${packageName}_active_version`
+    const previous = storage.load<string>(key)
+    const result = storage.save(key, version)
+    if (result.is_ok() && (previous.is_error() || previous.value !== version)) {
+      // Selecting an already-installed workspace pin must update cached app
+      // metadata and subscribers just like a new installation does.
+      this.refreshNeeded = true
+      this.notify()
+    }
+    return result
+  }
+
+  /**
+   * Newest `dev-*` snapshot that still has a resolvable UI or background
+   * entry. Semver store installs are ignored — a live-dev tile must not
+   * silently fall back to a released store bundle when the laptop drops.
+   */
+  public getLatestDevSnapshotVersion(packageName: string): string | null {
+    const versions = this.getInstalledVersions(packageName)
+      .filter((v) => v.startsWith("dev-"))
+      .sort()
+      .reverse()
+    for (const version of versions) {
+      const paths = this.getMiniappEntryPaths(packageName, version)
+      if (paths?.background || paths?.ui) return version
+    }
+    return null
+  }
+
+  /** True iff {@link getLatestDevSnapshotVersion} finds a usable snapshot. */
+  public hasDevSnapshot(packageName: string): boolean {
+    return this.getLatestDevSnapshotVersion(packageName) != null
   }
 
   public getMetadata(packageName: string, version: string): InstalledInfo {
@@ -680,7 +867,11 @@ class AppRegistry {
       const lmaDir = new Directory(Paths.document, "lmas", packageName, version)
       const miniappJsonFile = new File(lmaDir, "miniapp.json")
       const manifest = JSON.parse(miniappJsonFile.textSync())
-      const logoUrl = new File(lmaDir, "icon.png").uri
+      const iconPath = typeof manifest.icon === "string" && manifest.icon.trim() ? manifest.icon : "icon.png"
+      const safeRelativeIcon =
+        !/^[a-z]+:/i.test(iconPath) && !iconPath.startsWith("/") && !iconPath.split("/").includes("..")
+      const declaredIcon = safeRelativeIcon ? new File(lmaDir, iconPath) : null
+      const logoUrl = declaredIcon?.exists ? declaredIcon.uri : new File(lmaDir, "icon.png").uri
       return {name: manifest.name, logoUrl: logoUrl}
     } catch (error) {
       console.error("APP_REGISTRY: Error getting local miniapp metadata", error)
@@ -709,12 +900,24 @@ class AppRegistry {
    * registration in finalizeInstall. Native offline apps keep top priority.
    */
   private mergeProjectedApps(diskApps: ClientApp[]): ClientApp[] {
-    const offline = this.projectOfflineApps()
+    const offline = this.projectOfflineApps().filter((app) => isOfflineSystemMiniappAllowed(app.packageName))
     const offlinePackages = new Set(offline.map((app) => app.packageName))
-    const dev = this.projectDevApps().filter((app) => !offlinePackages.has(app.packageName))
+    const superMode = useSettingsStore.getState().getSetting(SETTINGS.super_mode.key) === true
+    const dev = this.projectDevApps().filter(
+      (app) => isDevMiniappAllowed(app.packageName, superMode) && !offlinePackages.has(app.packageName) && !this.getSelectedDevSnapshot(app.packageName),
+    )
     const devPackages = new Set(dev.map((app) => app.packageName))
     const installed = diskApps.filter(
-      (app) => !offlinePackages.has(app.packageName) && !devPackages.has(app.packageName),
+      (app) =>
+        (app.version?.startsWith("dev-")
+          ? isDevMiniappAllowed(app.packageName, superMode)
+          : isInstalledMiniappAllowed(
+              app.packageName,
+              app.version,
+              app.version ? this.getReleaseIdentity(app.packageName, app.version) : null,
+            )) &&
+        !offlinePackages.has(app.packageName) &&
+        !devPackages.has(app.packageName),
     )
     return [...installed, ...dev, ...offline]
   }
@@ -736,6 +939,7 @@ class AppRegistry {
       const out: ClientApp[] = []
       for (const lmaInfo of installedInfo) {
         const versionString = await this.getActiveVersion(lmaInfo.packageName)
+        if (!versionString) continue
         const versionInfo = lmaInfo.versions[versionString]
 
         const manifest = this.getMiniappManifest(lmaInfo.packageName, versionString) as {
@@ -756,7 +960,7 @@ class AppRegistry {
         // their version directory name starts with "dev-".
         const isMiniappDev = versionString.startsWith("dev-")
         let devUrl: string | undefined
-        if (isMiniappDev) {
+        if (isMiniappDev && !this.getSelectedDevSnapshot(lmaInfo.packageName)) {
           const devUrlRes = storage.load<string>(`${lmaInfo.packageName}_dev_url`)
           if (devUrlRes.is_ok()) devUrl = devUrlRes.value
         }
@@ -816,6 +1020,11 @@ class AppRegistry {
    */
   private projectDevApps(): ClientApp[] {
     return getDevAppRecords().map((rec) => {
+      // Every dev rebuild has a unique snapshot directory. Prefer its manifest
+      // icon so home tiles update with the bundle instead of retaining the
+      // separately cached, stable-path QR preview (and its decoded image cache).
+      const snapshotVersion = this.getLatestDevSnapshotVersion(rec.packageName)
+      const snapshotIcon = snapshotVersion ? this.getMetadata(rec.packageName, snapshotVersion).logoUrl : undefined
       const permissions = normalizeManifestPermissions(rec.permissions)
       const hardwareRequirements = buildHardwareRequirements(rec.hardwareRequirements, rec.packageName)
       return {
@@ -830,7 +1039,7 @@ class AppRegistry {
         offlineRoute: "",
         name: rec.name,
         webviewUrl: "",
-        logoUrl: rec.iconUrl,
+        logoUrl: snapshotIcon || rec.iconUrl,
         type: normalizeManifestType(rec.type),
         permissions,
         hardwareRequirements,
@@ -979,7 +1188,6 @@ export interface DevAppRecord {
 
 const DEV_APPS_INDEX_KEY = "dev_apps_index"
 const DEV_APP_ICONS_DIR = "dev-miniapp-icons"
-
 
 function isPrivateLanHost(hostname: string): boolean {
   return (
@@ -1144,8 +1352,7 @@ export async function registerDevApp(record: DevAppRecord): Promise<void> {
   // Relaunch paths (developer-URL screen, loadDevMiniapp) omit mdnsHost, so an
   // omitted field keeps whatever the QR scan stored instead of wiping the
   // `.local` failover host.
-  const mdnsHost =
-    record.mdnsHost !== undefined ? record.mdnsHost.trim() || undefined : readStoredMdnsHost(packageName)
+  const mdnsHost = record.mdnsHost !== undefined ? record.mdnsHost.trim() || undefined : readStoredMdnsHost(packageName)
   const devRecord: DevAppRecord = {
     ...record,
     packageName,
@@ -1155,6 +1362,7 @@ export async function registerDevApp(record: DevAppRecord): Promise<void> {
     mdnsHost,
   }
   storage.save(`${packageName}_dev_meta`, JSON.stringify(devRecord))
+  storage.remove(`${packageName}_dev_selected_snapshot`)
   storage.save(`${packageName}_dev_url`, record.devUrl)
   if (typeof record.devPort === "number" && Number.isFinite(record.devPort)) {
     storage.save(`${packageName}_dev_port`, record.devPort)

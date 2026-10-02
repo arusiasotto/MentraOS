@@ -4,7 +4,10 @@ import {readFileSync, statSync, writeFileSync} from "node:fs"
 import path from "node:path"
 import {fileURLToPath} from "node:url"
 
+import {prepareDownloads} from "./coordinated-install-downloads.mjs"
+import {artifactUrl} from "./release-artifact-storage.mjs"
 import {serializeReleaseRecord} from "./release-family.mjs"
+import {validateMentraosTestflightDistribution} from "./mentraos-testflight-distribution.mjs"
 
 const STATUSES = new Set(["built", "published", "reused"])
 
@@ -46,22 +49,76 @@ function publication({status, coordinate, url, provenanceUrl, file}) {
   }
 }
 
-export function createAndroidRecord({plan, apk, apkUrl, aab, aabUrl, playTrack, storeStatus, provenanceUrl}) {
+// Internal App Sharing serves one Play-signed artifact per upload with no
+// track floor. Its download URL is the publication; the digest and
+// certificate fingerprint Play reports describe the artifact Play generated
+// from the AAB, so they travel with the publication as Play's evidence next to
+// the built AAB's own digest.
+function internalSharingPublication({playTrack, storeStatus, internalSharing}) {
+  if (playTrack !== "internal-app-sharing") {
+    if (internalSharing) throw new Error(`Internal App Sharing evidence does not belong to the ${playTrack} track`)
+    return {url: "https://play.google.com/console/"}
+  }
+  if (storeStatus === "built") return {url: "https://play.google.com/console/"}
+  if (!/^https:\/\//.test(internalSharing?.downloadUrl || "")) {
+    throw new Error("Internal App Sharing evidence has no HTTPS download URL")
+  }
+  return {
+    url: internalSharing.downloadUrl,
+    playArtifact: {
+      sha256: typeof internalSharing.sha256 === "string" ? internalSharing.sha256 : "",
+      certificateFingerprint:
+        typeof internalSharing.certificateFingerprint === "string" ? internalSharing.certificateFingerprint : "",
+    },
+  }
+}
+
+export function createAndroidRecord({
+  plan,
+  apk,
+  apkUrl,
+  aab,
+  aabUrl,
+  playTrack,
+  storeStatus,
+  provenanceUrl,
+  internalSharing,
+  androidBuildNumber = plan.native?.buildNumber,
+}) {
   validatePlan(plan)
-  if (!playTrack) throw new Error("Google Play track is required")
+  // A testing track above the family window lends the Android build its floor
+  // plus one (resolve-android-version-code.mjs); the code is never below the
+  // family number.
+  if (!Number.isSafeInteger(androidBuildNumber) || androidBuildNumber < plan.native.buildNumber) {
+    throw new Error(
+      `Android build number ${androidBuildNumber} is below the family build number ${plan.native.buildNumber}`,
+    )
+  }
+  const uploadGooglePlay = plan.native.googlePlayUpload !== false
+  if (!uploadGooglePlay && plan.channel !== "dev") throw new Error("Only dev may skip Google Play publication")
+  if (uploadGooglePlay && !playTrack) throw new Error("Google Play track is required")
+  const {url, playArtifact} = uploadGooglePlay
+    ? internalSharingPublication({playTrack, storeStatus, internalSharing})
+    : {}
   return {
     schemaVersion: 1,
     releaseSetId: plan.releaseSetId,
+    native: {androidBuildNumber},
     publications: {
-      mentraos: {
-        "google-play": publication({
-          status: storeStatus,
-          coordinate: `com.mentra.mentra:${plan.native.buildNumber}:${playTrack}`,
-          url: "https://play.google.com/console/",
-          provenanceUrl,
-          file: aab,
-        }),
-      },
+      mentraos: uploadGooglePlay
+        ? {
+            "google-play": {
+              ...publication({
+                status: storeStatus,
+                coordinate: `com.mentra.mentra:${androidBuildNumber}:${playTrack}`,
+                url,
+                provenanceUrl,
+                file: aab,
+              }),
+              ...(playArtifact ? {playArtifact} : {}),
+            },
+          }
+        : {},
     },
     artifacts: [
       publication({
@@ -82,24 +139,52 @@ export function createAndroidRecord({plan, apk, apkUrl, aab, aabUrl, playTrack, 
   }
 }
 
-export function createIosRecord({plan, ipa, ipaUrl, testflightGroup, storeStatus, provenanceUrl}) {
+export function createIosRecord({
+  plan,
+  ipa,
+  ipaUrl,
+  testflightGroup,
+  storeStatus,
+  provenanceUrl,
+  testflight,
+  downloads,
+  otaUrl,
+  repository,
+}) {
   validatePlan(plan)
   if (!testflightGroup) throw new Error("TestFlight group is required")
+  if (storeStatus !== "built" && (plan.native.testflight || testflight)) {
+    validateMentraosTestflightDistribution(plan, testflightGroup, testflight)
+  }
   return {
     schemaVersion: 1,
     releaseSetId: plan.releaseSetId,
     publications: {
       mentraos: {
-        "app-store-connect": publication({
-          status: storeStatus,
-          coordinate: `com.mentra.mentra:${plan.native.marketingVersion}:${plan.native.buildNumber}:${testflightGroup}`,
-          url: "https://appstoreconnect.apple.com/apps",
-          provenanceUrl,
-          file: ipa,
-        }),
+        "app-store-connect": {
+          ...publication({
+            status: storeStatus,
+            coordinate: `com.mentra.mentra:${plan.native.marketingVersion}:${plan.native.buildNumber}:${testflightGroup}`,
+            url: "https://appstoreconnect.apple.com/apps",
+            provenanceUrl,
+            file: ipa,
+          }),
+          ...(testflight ? {testflight} : {}),
+        },
       },
     },
     artifacts: [
+      ...(downloads
+        ? Object.values(prepareDownloads(downloads, plan, repository, otaUrl).artifacts).map((asset) =>
+            publication({
+              status: storeStatus,
+              coordinate: asset.name,
+              url: artifactUrl(repository, plan.artifactContainerTag, asset.name),
+              provenanceUrl,
+              file: path.join(downloads, asset.name),
+            }),
+          )
+        : []),
       publication({
         status: storeStatus,
         coordinate: plan.artifactNames.iosApp,
@@ -119,6 +204,7 @@ export function mergeMobileRecords({plan, android, ios}) {
   return {
     schemaVersion: 1,
     releaseSetId: plan.releaseSetId,
+    ...(android.native ? {native: android.native} : {}),
     publications: {
       mentraos: {...android.publications.mentraos, ...ios.publications.mentraos},
     },
@@ -152,13 +238,29 @@ function main() {
       playTrack: args["play-track"],
       storeStatus: args.status,
       provenanceUrl: args["provenance-url"],
+      internalSharing: args["internal-sharing"] ? readJson(path.resolve(args["internal-sharing"])) : undefined,
+      ...(args["android-build-number"] ? {androidBuildNumber: Number(args["android-build-number"])} : {}),
     })
   } else if (command === "create-ios") {
     record = createIosRecord({
       plan,
+      downloads: args.downloads || undefined,
+      otaUrl: process.env.COORDINATED_OTA_URL,
+      repository: process.env.GITHUB_REPOSITORY,
       ipa: path.resolve(args.ipa),
       ipaUrl: args["ipa-url"],
       testflightGroup: args["testflight-group"],
+      testflight: args["distribution-status"]
+        ? {
+            group: args["testflight-group"],
+            audience: args.audience,
+            status: args["distribution-status"],
+            buildId: args["build-id"],
+            installUrl: args["install-url"],
+            reviewState: args["review-state"] || "",
+            skipReason: args["skip-reason"] || "",
+          }
+        : undefined,
       storeStatus: args.status,
       provenanceUrl: args["provenance-url"],
     })

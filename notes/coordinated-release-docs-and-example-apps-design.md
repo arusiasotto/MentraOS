@@ -136,6 +136,23 @@ accepting that exact Starter Kit result.
 This boundary avoids both a Git submodule and copied build logic. MentraOS
 consumes a validated result from the repository that owns the source.
 
+A submodule would make one Starter Kit commit visible in the MentraOS tree, but
+it would not advance the Starter Kit channel branches, run their protected
+validation, or publish their artifacts. It would also create a cycle: the final
+Starter Kit release commit does not exist until MentraOS has allocated the
+coordinated identity and published the dependencies that commit consumes.
+Instead, the first workflow attempt freezes one exact Starter Kit source SHA in
+the immutable release-plan artifact before any dependent publication starts,
+and the Starter Kit workflow rejects a different head. A later attempt of the
+same GitHub run restores that plan and recreates it byte for byte instead of
+reading the channel branch again. If no plan artifact exists, no dependent job
+could have started, so selecting the current channel head is still safe. For a
+release-family cut, the MentraOS staging merge also records the selected SHA in
+a `Starter-Kit-Source` Git trailer, so the explicit cross-repository selection
+is part of the exact MentraOS source commit. This provides the useful provenance
+of a submodule without moving source ownership or requiring a second MentraOS
+commit after every example release.
+
 ## Branch and Channel Model
 
 The Starter Kit mirrors the coordinated product channels:
@@ -150,6 +167,36 @@ Human Starter Kit features land on `dev`. Stabilization fixes may land on
 `staging` first and must be merged back into `dev`. Production changes move
 through `staging`; automation must not treat `main` as an independent feature
 branch.
+
+### Release-family cut
+
+The release-family cut is ordered across both repositories:
+
+1. promote an exact Starter Kit `dev` head into Starter Kit `staging`;
+2. promote an exact MentraOS `dev` head into MentraOS `staging`, which starts
+   the coordinated beta release;
+3. let the beta release synchronize its exact beta dependency versions into
+   Starter Kit `staging` and finish all release gates;
+4. after that coordinated beta run succeeds, merge Starter Kit `staging` back
+   into Starter Kit `dev`; and
+5. prepare the next MentraOS family on `dev`, whose first coordinated dev run
+   then synchronizes the Starter Kit `dev` dependencies to that family.
+
+The reverse merge in step 4 is required release bookkeeping, not an optional
+source cleanup. The coordinated beta creates channel-owned version and lockfile
+commits on `staging`; reconciling that commit before the next dev-family sync
+keeps the next `dev` to `staging` promotion from manufacturing predictable
+conflicts in generated files.
+
+`bun run release:promote-family -- start --next X.Y.Z` performs steps 1 and 2
+with exact-head promotion branches and prints the coordinated beta run. After
+that run is successful, `finish --next X.Y.Z --run RUN_ID` verifies that the run
+and its downloaded release plan match the current staging commit, family, and
+Starter Kit trailer before it performs step 4 and runs the existing next-family
+preparation for the follow-up MentraOS pull request. If preparation fails after
+writing its expected local diff, the same `finish` command recognizes and
+resumes that dirty partial preparation. Both phases are rerunnable and fail
+rather than resolving a human source conflict or replacing a moving branch.
 
 A bot dependency-sync commit is release output, not a new release request. It
 must carry explicit machine-readable metadata so it cannot trigger a dispatch
@@ -180,9 +227,13 @@ to TestFlight.
 ### Coordinated example release
 
 `coordinated-example-release.yml` is invoked by an authenticated dispatch from
-MentraOS. The coordinator uses GitHub's cross-repository `repository_dispatch`
-endpoint, which is covered by the GitHub App's existing Contents write grant;
-manual `workflow_dispatch` remains available for operators. Required inputs are:
+MentraOS. The coordinator uses GitHub's cross-repository `workflow_dispatch`
+endpoint and selects the Starter Kit branch that owns the release channel:
+`dev` for dev and `staging` for beta. This makes the workflow implementation
+and checked-out source come from the same channel instead of running
+default-branch orchestration against another branch. The coordinator GitHub
+App therefore requires Actions write in addition to its existing grants.
+Operators can invoke the same workflow manually. Required inputs are:
 
 - `releaseSetId`;
 - `releaseIdentity`;
@@ -271,7 +322,7 @@ uses one token for the bounded request phase, waits for the immutable public
 result without credentials, and mints a fresh read-only token for final
 provenance verification. The App is
 installed only on `MentraOS` and `Mentra-Bluetooth-SDK-Starter-Kit` with
-Actions read, Checks read, Contents read/write, and Pull requests read/write
+Actions read/write, Checks read, Contents read/write, and Pull requests read/write
 permissions. Each job requests only the subset it uses when minting its token.
 
 During bootstrap, the implementation may fall back to the existing scoped SDK
@@ -340,8 +391,8 @@ schema versions fail closed.
 
 ## GitHub Release Containers
 
-Coordinated prereleases do not create one visible GitHub release per commit.
-MentraOS keeps its existing base-version container:
+MentraOS stores coordinated prerelease artifacts in its existing base-version
+container (with new binaries hosted on the artifact CDN):
 
 ```text
 mentra-builds-v3.1.0
@@ -359,6 +410,13 @@ as `sdk-3.1.0-dev.42` and `sdk-3.1.0-beta.57` identify the exact Starter Kit
 commit even though their downloadable assets share one visible release page.
 The grouped container tag is fixed when the container is created and is never
 used as source provenance or force-moved to the newest example commit.
+
+Each completed Mentra dev/beta build also has a GitHub prerelease page at its
+`mentra-v<release identity>` source tag. Its description links directly to the
+main Mentra App APK/AAB/IPA, glasses artifacts, SDK packages, and manifest in
+the shared container. It does not duplicate binaries. Page creation consumes
+the archived final manifest in a separate job, so a GitHub API failure can be
+retried without republishing immutable artifacts or blocking example dispatch.
 
 Stable publication uses the stable containers `mentra-v3.1.0` and
 `sdk-3.1.0`. It does not rename a prerelease artifact and pretend its embedded
@@ -404,8 +462,8 @@ The checked-in Mintlify config retains these structured variables:
 
 - `release-version`;
 - `release-artifacts-url`;
-- `example-app-version`; and
-- `example-app-url`; and
+- `example-app-download-label`;
+- `example-app-url`;
 - `example-app-ios-url`.
 
 For dev and beta, the renderer receives both the immutable Mentra release plan
@@ -413,7 +471,7 @@ and the validated Starter Kit result. It sets:
 
 - `release-version` to the exact coordinated identity;
 - `release-artifacts-url` to the coordinated Mentra release container;
-- `example-app-version` to that same exact identity; and
+- `example-app-download-label` to download copy naming that exact SDK identity;
 - `example-app-url` to the published React Native APK URL from the Starter Kit
   result, never to a constructed or guessed URL; and
 - `example-app-ios-url` to the verified App Store Connect group URL for dev or
@@ -465,16 +523,28 @@ release set.
 ### Production docs
 
 Production remains a Mintlify Git deployment from `main`. The checked-in
-variables use the stable family base and stable URLs. The protected production
-flow must publish and verify the stable Starter Kit result before production
-documentation is declared complete. Moving Mintlify's configured source branch
-from `staging` to `main` is an operator action.
+variables use the stable family base and stable URLs. Example-app copy is
+version-neutral and the Android link is labelled as browsing the releases
+index. Only the dev/beta renderer promises a direct APK for an exact SDK
+identity, using the validated Starter Kit result. Source-only and stable docs
+must not expose placeholder versions or claim that the releases index is a
+direct APK download. Before production starts,
+an operator promotes the exact Starter Kit merge commit recorded by the selected
+completed beta from Starter Kit `staging` to `main`, then promotes the exact
+MentraOS beta source from MentraOS `staging` to `main`. Both selected sources
+must already contain their repository's `main`; otherwise `main` is back-merged
+to `staging` and a new coordinated beta is required.
 
-The initial cross-repository implementation focuses on `dev` and `staging`,
-where CI controls rendering and ordering. Stable Starter Kit synchronization
-and the exact Mintlify publication check are added before the first production
-release under this model. A temporary not-found production link is not an
-accepted steady state.
+This branch cut keeps both repositories aligned but does not add the Starter Kit
+example app to the production artifact workflow. Production promotion remains
+Mentra-App-only: it does not rebuild, upload, submit, or release the example app.
+Moving Mintlify's configured source branch from `staging` to `main` is an
+operator action.
+
+The cross-repository prerelease implementation focuses on `dev` and `staging`,
+where CI controls rendering and ordering. Stable branch synchronization is an
+explicit pre-production operation over the immutable completed beta result. A
+temporary not-found production link is not an accepted steady state.
 
 ## Slack Notifications
 
@@ -483,7 +553,8 @@ The existing channel mapping remains:
 - `dev` posts to `dev-builds` through `SLACK_WEBHOOK_DEV_BUILDS`;
 - `staging` posts to `staging-builds` through the existing staging webhook.
 
-One final coordinated message reports the full release, including:
+Core release completion and the independently dispatched examples/docs workflow
+post separate messages. Together they report:
 
 - release identity and source commit;
 - success or failure of OTA, npm, native SDK, MentraOS, Engine consumer,
@@ -497,6 +568,11 @@ One final coordinated message reports the full release, including:
 
 Slack never guesses an artifact URL. It uses the validated release plan,
 MentraOS outputs, and Starter Kit result.
+
+The examples message repeats the main Mentra App APK and IPA links from the
+completed core manifest, so an example store failure does not hide the phone
+app downloads. A failed release-page job is reported separately from core
+completion; the core message falls back to the shared artifact container link.
 
 ## Concurrency and Retries
 

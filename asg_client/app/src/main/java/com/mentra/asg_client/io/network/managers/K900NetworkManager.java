@@ -12,12 +12,13 @@ import android.provider.Settings;
 import android.util.Log;
 import com.mentra.asg_client.AsgConstants;
 import com.mentra.asg_client.io.network.core.BaseNetworkManager;
-import com.mentra.asg_client.io.network.utils.WifiSecurityChooser;
 import com.mentra.asg_client.io.network.interfaces.IWifiScanCallback;
+import com.mentra.asg_client.io.network.interfaces.WifiForgetOutcome;
 import com.mentra.asg_client.io.network.utils.DebugNotificationManager;
+import com.mentra.asg_client.io.network.utils.WifiSecurityChooser;
 import com.mentra.asg_client.io.ota.session.OtaSessionManager;
 import com.mentra.asg_client.service.system.core.SystemControllerFactory;
-import java.util.ArrayList;
+import com.mentra.asg_client.service.system.interfaces.ISystemController;
 import java.net.Inet4Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
@@ -37,8 +38,10 @@ public class K900NetworkManager extends BaseNetworkManager {
 
     private final WifiManager wifiManager;
     private final DebugNotificationManager notificationManager;
+    private final ISystemController systemController;
     private BroadcastReceiver wifiStateReceiver;
     private final boolean isSystemApp;
+    private final StationAutojoinPause stationAutojoinPause;
 
     private final Handler mWifiStateHandler = new Handler(Looper.getMainLooper());
     private final Handler mHotspotHandler = new Handler(Looper.getMainLooper());
@@ -54,10 +57,16 @@ public class K900NetworkManager extends BaseNetworkManager {
      * @param context The application context
      */
     public K900NetworkManager(Context context) {
+        this(context, SystemControllerFactory.get(context));
+    }
+
+    K900NetworkManager(Context context, ISystemController systemController) {
         super(context);
         this.wifiManager = (WifiManager) context.getSystemService(Context.WIFI_SERVICE);
         this.notificationManager = new DebugNotificationManager(context);
+        this.systemController = systemController;
         this.isSystemApp = checkIsSystemApp(context);
+        this.stationAutojoinPause = StationAutojoinPause.create(context, wifiManager);
 
         Log.i(TAG, "📶 K900NetworkManager initialized, isSystemApp=" + isSystemApp);
         notificationManager.showDebugNotification(
@@ -94,6 +103,8 @@ public class K900NetworkManager extends BaseNetworkManager {
         Log.d(TAG, "🌐 ✅ WiFi state receiver registered");
 
         adoptExistingVendorHotspot();
+        // A pause left behind by a crash or reinstall while the hotspot was up.
+        if (!isHotspotEnabled) stationAutojoinPause.resume();
 
         // Check if we're already connected to WiFi
         boolean wifiConnected = isConnectedToWifi();
@@ -133,6 +144,13 @@ public class K900NetworkManager extends BaseNetworkManager {
                             + " gateway="
                             + gatewayIp);
         }
+    }
+
+    @Override
+    protected void onHotspotActiveChanged(boolean active) {
+        if (!isSystemApp) return;
+        if (active) stationAutojoinPause.pause();
+        else stationAutojoinPause.resume();
     }
 
     @Override
@@ -567,8 +585,8 @@ public class K900NetworkManager extends BaseNetworkManager {
     }
 
     /**
-     * Latest scan capabilities string for an SSID (strongest BSS wins), or null when the
-     * SSID is not in current scan results.
+     * Latest scan capabilities string for an SSID (strongest BSS wins), or null when the SSID is
+     * not in current scan results.
      */
     private String findScanCapabilitiesForSsid(String ssid) {
         try {
@@ -616,23 +634,41 @@ public class K900NetworkManager extends BaseNetworkManager {
     }
 
     @Override
-    public void forgetWifiNetwork(String ssid) {
+    public WifiForgetOutcome forgetWifiNetwork(String ssid) {
         Log.d(TAG, "📶 =========================================");
         Log.d(TAG, "📶 FORGET WIFI NETWORK: " + ssid);
         Log.d(TAG, "📶 =========================================");
 
         try {
-            // Use SysControl to forget - the SmartXY broadcast reliably removes saved networks
-            Log.d(TAG, "📶 📡 Forgetting WiFi network via SysControl...");
-            SystemControllerFactory.get(context).disconnectFromWifi(ssid);
+            // SysControl only dispatches an asynchronous SystemUI broadcast. Reaching this point
+            // confirms local dispatch, not vendor receipt or completed credential removal.
+            Log.d(TAG, "📶 📡 Dispatching WiFi forget request via SysControl...");
+            systemController.disconnectFromWifi(ssid);
 
-            Log.i(TAG, "📶 ✅ WiFi forget command sent for: " + ssid);
-            notificationManager.showDebugNotification("WiFi Network Forgotten", "Removed: " + ssid);
+            Log.i(TAG, "📶 WiFi forget command dispatched for: " + ssid);
+            notificationManager.showDebugNotification(
+                    "WiFi Forget Requested", "Dispatched removal request for: " + ssid);
+            return WifiForgetOutcome.DISPATCHED;
         } catch (Exception e) {
             Log.e(TAG, "📶 💥 Error forgetting WiFi network", e);
             notificationManager.showDebugNotification(
                     "WiFi Error", "Failed to forget: " + e.getMessage());
+            return WifiForgetOutcome.FAILED;
         }
+    }
+
+    @Override
+    public int getSavedWifiNetworksVersion() {
+        return 0;
+    }
+
+    @Override
+    public List<String> getConfiguredWifiNetworks() {
+        // K900 credentials are owned by SystemUI/SysControl. The vendor surface used here has no
+        // response callback for get_configured_networks, and WifiManager may be empty or stale, so
+        // fail explicitly instead of returning a list that cannot be trusted for forget commands.
+        throw new UnsupportedOperationException(
+                "K900 saved WiFi network listing has no vendor response path");
     }
 
     private void promptConnectToWifi(String ssid, String password) {
@@ -708,27 +744,6 @@ public class K900NetworkManager extends BaseNetworkManager {
                 Log.w(TAG, "Receiver already unregistered", e);
             }
         }
-    }
-
-    @Override
-    public List<String> getConfiguredWifiNetworks() {
-        Log.d(TAG, "Getting configured WiFi networks from K900");
-        List<String> networks = new ArrayList<>();
-
-        // Use K900-specific broadcast to get configured networks
-        try {
-            Intent intent = new Intent(K900_BROADCAST_ACTION);
-            intent.putExtra("command", "get_configured_networks");
-            context.sendBroadcast(intent);
-
-            // For now, return empty list as K900 response handling is complex
-            // In a real implementation, you would register a receiver for the response
-            Log.d(TAG, "K900 configured networks request sent");
-        } catch (Exception e) {
-            Log.e(TAG, "Error getting configured networks from K900", e);
-        }
-
-        return networks;
     }
 
     @Override

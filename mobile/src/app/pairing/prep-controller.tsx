@@ -4,7 +4,7 @@ import {Linking, PermissionsAndroid, Image, Platform, ScrollView, View} from "re
 import type {Permission} from "react-native"
 
 import {MentraLogoStandalone} from "@/components/brands/MentraLogoStandalone"
-import {Button, Header, Icon, Screen, Text} from "@/components/ignite"
+import {Button, Header, Screen, Text} from "@/components/ignite"
 import {useAppTheme} from "@/contexts/ThemeContext"
 import {useNavigationStore} from "@/stores/navigation"
 import {translate} from "@/i18n"
@@ -139,21 +139,7 @@ export default function PairingPrepScreen() {
         }
       }
 
-      // Request microphone permission (needed for both platforms)
-      console.log("Requesting microphone permission...")
-
-      // This now handles showing alerts for previously denied permissions internally
-      const micGranted = await requestFeaturePermissions(PermissionFeatures.MICROPHONE)
-
-      console.log("Microphone permission result:", micGranted)
-
-      if (!micGranted) {
-        // The specific alert for previously denied permission is already handled in requestFeaturePermissions
-        // We just need to stop the flow here
-        return
-      }
-
-      // Request location permission (needed for Android BLE scanning)
+      // Android BLE scanning also requires location access.
       if (Platform.OS === "android") {
         console.log("Requesting location permission for Android BLE scanning...")
 
@@ -213,25 +199,15 @@ export default function PairingPrepScreen() {
         showsVerticalScrollIndicator>
         <View className="flex-col items-center justify-center bg-primary-foreground rounded-xl mb-6">
           <Image
-            source={require("../../../assets/glasses/even_realities_g2/even_realities_g2.png")}
+            source={require("../../../assets/glasses/even_realities/r1/ring.png")}
             resizeMode="contain"
-            className="w-50 h-25"
-          />
-          <Icon name="chevron-down" size={36} color={theme.colors.text} />
-          <Image
-            source={require("../../../assets/guide/image_g1_pair.png")}
-            resizeMode="contain"
-            className="w-62 h-38"
+            className="w-50 h-50"
           />
         </View>
 
         <View style={{justifyContent: "flex-start", flexDirection: "column"}}>
           <Text tx="pairing:instructions" className="text-2xl font-bold mb-4 text-secondary-foreground" />
-          <Text
-            className="text-lg text-secondary-foreground"
-            text="1. Disconnect your G2 from within the Even Realities app, or uninstall the Even Realities app"
-          />
-          <Text className="text-lg text-secondary-foreground" text="2. Place your G2 in the charging case." />
+          <Text className="text-lg text-secondary-foreground" tx="pairing:r1PreviousPhone" />
         </View>
       </ScrollView>
     )
@@ -243,7 +219,7 @@ export default function PairingPrepScreen() {
       <>
         <View className="gap-4">
           <Button tx="pairing:g1Ready" onPress={advanceToPairing} />
-          {/* <Button tx="pairing:g1NotReady" preset="secondary" onPress={() => setShowTroubleshootingModal(true)} /> */}
+          <Button tx="pairing:needMoreHelp" preset="secondary" onPress={() => setShowTroubleshootingModal(true)} />
         </View>
         <GlassesTroubleshootingModal
           isVisible={showTroubleshootingModal}
@@ -254,10 +230,30 @@ export default function PairingPrepScreen() {
     )
   }
 
+  const KeyfobPairingGuide = () => {
+    return (
+      <ScrollView className="flex-1 mt-6" contentContainerStyle={{paddingBottom: 24}} showsVerticalScrollIndicator>
+        <View className="flex-col items-center justify-center bg-primary-foreground rounded-xl mb-6 py-4">
+          <Image
+            source={require("../../../assets/glasses/xiao_keyfob.png")}
+            resizeMode="contain"
+            className="w-50 h-25"
+          />
+        </View>
+        <Text tx="pairing:instructions" className="text-2xl font-bold mb-4 text-secondary-foreground" />
+        <Text className="text-lg text-secondary-foreground mb-2" tx="pairingGuides:KEYFOB.disclaimer" />
+        <Text className="text-lg text-secondary-foreground mb-2" tx="pairingGuides:KEYFOB.step1" />
+        <Text className="text-lg text-secondary-foreground mb-2" tx="pairingGuides:KEYFOB.step2" />
+      </ScrollView>
+    )
+  }
+
   const renderGuide = () => {
     switch (deviceModel) {
       case ControllerTypes.R1:
         return <R1PairingGuide />
+      case ControllerTypes.KEYFOB:
+        return <KeyfobPairingGuide />
     }
 
     throw new Error(`Unknown model name: ${deviceModel}`)

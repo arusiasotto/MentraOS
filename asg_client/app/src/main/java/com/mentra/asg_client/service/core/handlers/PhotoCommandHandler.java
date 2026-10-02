@@ -2,12 +2,16 @@ package com.mentra.asg_client.service.core.handlers;
 
 import android.content.Context;
 import android.util.Log;
+import com.mentra.asg_client.io.media.core.PhotoCompression;
 import com.mentra.asg_client.AsgConstants;
 import com.mentra.asg_client.camera.model.PhotoCaptureSettings;
 import com.mentra.asg_client.camera.policy.PhotoMode;
 import com.mentra.asg_client.camera.policy.PhotoSizeTier;
 import com.mentra.asg_client.io.file.core.FileManager;
+import com.mentra.asg_client.io.hardware.core.HardwareManagerFactory;
 import com.mentra.asg_client.io.media.core.MediaCaptureService;
+import com.mentra.asg_client.io.media.core.StreamPhotoTarget;
+import com.mentra.asg_client.io.streaming.services.WhipStreamingService;
 import com.mentra.asg_client.service.core.constants.BatteryConstants;
 import com.mentra.asg_client.service.legacy.managers.AsgClientServiceManager;
 import com.mentra.asg_client.service.system.interfaces.IStateManager;
@@ -285,6 +289,14 @@ public class PhotoCommandHandler extends BaseMediaCommandHandler {
                 logCommandResult("take_photo", false, "Media capture service not available");
                 return false;
             }
+            if (data.optBoolean("presend_thumbnail", false)
+                    && (webhookUrl.trim().isEmpty() || !bleImgId.matches("I[A-Za-z0-9_-]{1,15}"))) {
+                captureService.sendPhotoErrorResponse(
+                        requestId,
+                        "INVALID_REQUEST",
+                        "presend_thumbnail requires an upload target and a valid bleImgId");
+                return false;
+            }
             if (transferMethod == null || !PHOTO_TRANSFER_METHODS.contains(transferMethod)) {
                 Object invalidTransferMethod = data.opt("transferMethod");
                 String message =
@@ -315,7 +327,7 @@ public class PhotoCommandHandler extends BaseMediaCommandHandler {
             // BATTERY CHECK: Reject if battery too low
             if (stateManager != null) {
                 int batteryLevel = stateManager.getBatteryLevel();
-                if (batteryLevel >= 0 && batteryLevel < BatteryConstants.MIN_BATTERY_LEVEL) {
+                if (BatteryConstants.isCameraBatteryLow(batteryLevel, HardwareManagerFactory.getInitializedInstance())) {
                     Log.w(TAG, "🚫 Photo rejected - battery too low (" + batteryLevel + "%)");
                     logCommandResult("take_photo", false, "Battery too low: " + batteryLevel + "%");
 
@@ -349,6 +361,24 @@ public class PhotoCommandHandler extends BaseMediaCommandHandler {
                         "VIDEO_RECORDING_ACTIVE",
                         "Video recording in progress - request rejected");
                 return false;
+            }
+
+            // STREAM PHOTO: a WHIP call on the glasses hotspot lends its camera to the shot and
+            // keeps publishing substitute frames. Only the phone's local still endpoint qualifies:
+            // the glasses have no internet on their own hotspot, and any other target still gets
+            // the CAMERA_BUSY rejection below.
+            if (WhipStreamingService.isActivelyStreaming()
+                    && StreamPhotoTarget.isLocalStillUpload(webhookUrl)) {
+                Log.i(
+                        TAG,
+                        "PHOTO PIPELINE [ASG 3/3] Stream photo during WHIP requestId="
+                                + requestId);
+                boolean accepted =
+                        captureService.takePhotoForStreamUpload(
+                                photoFilePath, requestId, webhookUrl, size, sound, captureSettings);
+                logCommandResult(
+                        "take_photo", accepted, accepted ? null : "Stream photo rejected");
+                return accepted;
             }
 
             // ARCHIVAL CAPTURE: a save-only request (no upload target) has no delivery leg —
@@ -406,6 +436,9 @@ public class PhotoCommandHandler extends BaseMediaCommandHandler {
             }
 
             // Process photo capture based on transfer method
+            if (data.optBoolean("presend_thumbnail", false)) {
+                captureService.requestThumbnail(requestId, bleImgId);
+            }
             if ("ble".equals(transferMethod) || !bleImgId.isEmpty()) {
                 captureService.markBlePhotoPipelineStart(requestId);
             }
@@ -520,6 +553,7 @@ public class PhotoCommandHandler extends BaseMediaCommandHandler {
                     mode,
                     flash,
                     sound,
+                    compress,
                     exposureTimeNs,
                     iso,
                     captureSettings);
@@ -536,6 +570,7 @@ public class PhotoCommandHandler extends BaseMediaCommandHandler {
                         mode,
                         flash,
                         sound,
+                        compress,
                         exposureTimeNs,
                         iso,
                         captureSettings);
@@ -627,8 +662,9 @@ public class PhotoCommandHandler extends BaseMediaCommandHandler {
     }
 
     private static String resolvePhotoCompress(JSONObject data, AsgSettings stored) {
-        if (data != null && data.has("compress") && !data.isNull("compress")) {
-            return data.optString("compress", "none");
+        if (data != null && data.has("compress")) {
+            PhotoCompression.fromValue(data.opt("compress"));
+            return (String) data.opt("compress");
         }
         // SDK take_photo requests that omit compress should use the SDK default (none), not
         // a stored button scan preset — button presets are for hardware-button captures only.

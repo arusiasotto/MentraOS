@@ -3,27 +3,44 @@ import {readFileSync, writeFileSync} from "node:fs"
 import path from "node:path"
 import {fileURLToPath} from "node:url"
 
-const ASSET_PATTERN = /^mentra-live-asg-(\d+)-([0-9a-f]{64})\.(apk|json)$/
-// The legacy publisher allocated seconds since 2025-01-01 and had already crossed
-// 50 million before this allocator replaced it. Keep the coordinated namespace
-// permanently above that range so the first cutover build is always an upgrade.
-const COORDINATED_VERSION_CODE_BASELINE = 100_000_000
+import {
+  BUILD_NUMBER_RELEASE_SEQUENCE_LIMIT,
+  familyBuildNumberPrefix,
+  familyBuildNumberWindow,
+} from "./release-family.mjs"
 
-export function allocateAsgVersion({assets, fingerprint, runNumber}) {
+const ASSET_PATTERN = /^mentra-live-asg-(\d+)-([0-9a-f]{64})\.(apk|json)$/
+// ASG version codes use the family build-number formula shared with the Mentra
+// App (see release-family.mjs): MAJOR*100_000_000 + MINOR*1_000_000 +
+// PATCH*10_000 + SEQUENCE. An ASG rebuilt in a coordinated run takes exactly
+// the build number that run reserved for its family, so it carries the same
+// number as the app built in that run; a fingerprint already built keeps its
+// recorded code. Assets outside the family window belong to older schemes and
+// are ignored.
+
+export function asgVersionCodePrefix(baseVersion) {
+  return familyBuildNumberPrefix(baseVersion)
+}
+
+// Reuse the published pair for this fingerprint, or take exactly the build
+// number the run reserved for its family (the plan's native build number). A
+// pull-request selection passes no build number: it only asks whether a
+// coordinated pair can be reused.
+export function allocateAsgVersion({assets, fingerprint, baseVersion, buildNumber = null}) {
   if (!Array.isArray(assets)) throw new Error("GitHub release assets must be an array")
   if (!/^[0-9a-f]{64}$/.test(fingerprint)) throw new Error("Invalid ASG fingerprint")
-  if (!Number.isSafeInteger(runNumber) || runNumber <= 0) throw new Error("runNumber must be a positive integer")
-
+  const window = familyBuildNumberWindow(baseVersion)
   const recognized = assets.flatMap((asset) => {
     const match = ASSET_PATTERN.exec(asset.name ?? "")
     if (!match) return []
-    return [{id: asset.id, name: asset.name, versionCode: Number(match[1]), fingerprint: match[2], type: match[3]}]
+    const versionCode = Number(match[1])
+    if (versionCode < window.first || versionCode > window.last) return []
+    return [{id: asset.id, name: asset.name, versionCode, fingerprint: match[2], type: match[3]}]
   })
   const matching = recognized.filter((asset) => asset.fingerprint === fingerprint)
   const apks = matching.filter((asset) => asset.type === "apk")
   const provenance = matching.filter((asset) => asset.type === "json")
   if (apks.length > 1 || provenance.length > 1) throw new Error("Duplicate immutable ASG release assets found")
-
   if (apks.length === 1 && provenance.length === 1) {
     if (apks[0].versionCode !== provenance[0].versionCode) {
       throw new Error("ASG artifact and provenance use different version codes")
@@ -36,15 +53,30 @@ export function allocateAsgVersion({assets, fingerprint, runNumber}) {
       orphanAssetIds: [],
     }
   }
-
-  const maxRecordedVersionCode = recognized.reduce((maximum, asset) => Math.max(maximum, asset.versionCode), 0)
-  const versionCode = Math.max(COORDINATED_VERSION_CODE_BASELINE + runNumber, maxRecordedVersionCode + 1)
-  if (versionCode > 2_100_000_000) throw new Error("Allocated ASG versionCode exceeds the Android-safe range")
+  if (buildNumber === null) {
+    return {
+      exists: false,
+      versionCode: null,
+      apkAsset: null,
+      provenanceAsset: null,
+      orphanAssetIds: matching.map((asset) => asset.id),
+    }
+  }
+  if (!Number.isSafeInteger(buildNumber) || buildNumber < window.first || buildNumber > window.last) {
+    throw new Error(`Build number ${buildNumber} does not belong to base version ${baseVersion}`)
+  }
+  if (buildNumber - window.prefix > BUILD_NUMBER_RELEASE_SEQUENCE_LIMIT) {
+    throw new Error(`Build number ${buildNumber} is outside the release band of base version ${baseVersion}`)
+  }
+  const taken = recognized.find((asset) => asset.versionCode === buildNumber && asset.fingerprint !== fingerprint)
+  if (taken) {
+    throw new Error(`ASG versionCode ${buildNumber} is already used by ${taken.name}`)
+  }
   return {
     exists: false,
-    versionCode,
-    apkAsset: `mentra-live-asg-${versionCode}-${fingerprint}.apk`,
-    provenanceAsset: `mentra-live-asg-${versionCode}-${fingerprint}.json`,
+    versionCode: buildNumber,
+    apkAsset: `mentra-live-asg-${buildNumber}-${fingerprint}.apk`,
+    provenanceAsset: `mentra-live-asg-${buildNumber}-${fingerprint}.json`,
     orphanAssetIds: matching.map((asset) => asset.id),
   }
 }
@@ -65,7 +97,8 @@ function main() {
   const result = allocateAsgVersion({
     assets: JSON.parse(readFileSync(path.resolve(args.assets), "utf8")),
     fingerprint: args.fingerprint,
-    runNumber: Number(args["run-number"]),
+    baseVersion: args["base-version"],
+    buildNumber: args["build-number"] !== undefined ? Number(args["build-number"]) : null,
   })
   writeFileSync(path.resolve(args.output), `${JSON.stringify(result, null, 2)}\n`)
 }

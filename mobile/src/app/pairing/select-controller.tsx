@@ -35,6 +35,8 @@ export default function SelectControllerScreen() {
       case DeviceTypes.G1:
       case DeviceTypes.G2:
         return <EvenRealitiesLogo color={theme.colors.text} />
+      case ControllerTypes.KEYFOB:
+        return <Text text="Seeed Studio (unofficial)" className="text-foreground font-semibold text-lg" />
       case DeviceTypes.LIVE:
       case DeviceTypes.NEX:
       case DeviceTypes.MACH1:
@@ -50,13 +52,12 @@ export default function SelectControllerScreen() {
   const controllerOptions =
     Platform.OS === "ios"
       ? [
-          // {deviceModel: DeviceTypes.SIMULATED, key: DeviceTypes.SIMULATED},
-          //{deviceModel: "Brilliant Labs Frame", key: "frame"},
           {deviceModel: ControllerTypes.R1, key: "evenrealities_r1"},
+          {deviceModel: ControllerTypes.KEYFOB, key: "xiao_keyfob"},
         ]
       : [
-          // Android:
           {deviceModel: ControllerTypes.R1, key: "evenrealities_r1"},
+          {deviceModel: ControllerTypes.KEYFOB, key: "xiao_keyfob"},
         ]
 
   const triggerGlassesPairingGuide = async (deviceModel: string) => {
@@ -77,7 +78,10 @@ export default function SelectControllerScreen() {
       <ScrollView className="-mr-4 pr-4 pt-6">
         <View className="flex-col gap-4 pb-8">
           {controllerOptions.map((controller) => (
-            <TouchableOpacity key={controller.key} onPress={() => triggerGlassesPairingGuide(controller.deviceModel)}>
+            <TouchableOpacity
+              key={controller.key}
+              testID={`pairing-model-${controller.key}`}
+              onPress={() => triggerGlassesPairingGuide(controller.deviceModel)}>
               <GlassView className="bg-primary-foreground border border-background flex-col items-center justify-center h-[190px] rounded-2xl overflow-hidden">
                 <View className="flex-col items-center justify-center gap-3 w-full">
                   <View className="items-center justify-center min-h-6">

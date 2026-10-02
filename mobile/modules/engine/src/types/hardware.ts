@@ -8,6 +8,7 @@ import { nimo } from "./capabilities/nimo";
 import { simulatedGlasses } from "./capabilities/simulated-glasses";
 import { vuzixZ100 } from "./capabilities/vuzix-z100";
 import { none } from "./capabilities/none";
+import { s3Watch } from "./capabilities/s3-watch";
 import { DeviceTypes } from "./enums";
 
 export type { HardwareRequirement } from "@mentra/miniapp/hardware";
@@ -39,6 +40,11 @@ export interface DisplayCapabilities {
   fieldOfView?: { horizontal?: number; vertical?: number };
   maxTextLines?: number;
   adjustBrightness?: boolean;
+  /** Physical display adjustment, distinct from positioning scene elements. */
+  position?: {
+    depth: {min: number; max: number};
+    height: {min: number; max: number};
+  };
 
   // --- Scene display API (display.render()) — typed capabilities ---
   // Pure DATA the host scene pipeline acts on generically; a device without
@@ -56,6 +62,12 @@ export interface DisplayCapabilities {
   shapes?: "rect"[];
   intensityLevels?: number;
   partialUpdate?: boolean;
+  /**
+   * True ⇒ overflowing G2-sized boxes (576×288) are clamped to that
+   * virtual canvas and kept, so the SGC can scale them. Default drops
+   * any image whose box does not fit the public canvas.
+   */
+  fitOverflowImages?: boolean;
 }
 
 /**
@@ -78,6 +90,8 @@ export interface SpeakerCapabilities {
  * IMU (Inertial Measurement Unit) capabilities
  */
 export interface IMUCapabilities {
+  /** Adjustable wake threshold; IMU presence alone does not imply support. */
+  headUpAngle?: {min: number; max: number};
   axisCount?: number;
   hasAccelerometer?: boolean;
   hasCompass?: boolean;
@@ -122,6 +136,8 @@ export interface PowerCapabilities {
  * Complete information about what hardware a device has
  */
 export interface Capabilities {
+  /** Firmware-owned notification history and popups; content relay is separate. */
+  hasNativeNotifications?: boolean;
   modelName: string;
 
   // Camera capabilities
@@ -183,13 +199,16 @@ export const HARDWARE_CAPABILITIES: Record<string, Capabilities> = {
   [vuzixZ100.modelName]: vuzixZ100,
   [nimo.modelName]: nimo,
   [DeviceTypes.MACH1]: vuzixZ100, // Mach1 uses same Vuzix Ultralite hardware as Z100
+  [s3Watch.modelName]: s3Watch,
   [DeviceTypes.AR99]: {
     ...evenRealitiesG1,
     modelName: DeviceTypes.AR99,
     display: {
       ...evenRealitiesG1.display,
       canDisplayBitmap: false,
+      position: undefined,
     },
+    imu: {...evenRealitiesG1.imu, headUpAngle: undefined},
     hasMicrophone: true,
     hasOta: true,
     microphone: {
@@ -200,8 +219,14 @@ export const HARDWARE_CAPABILITIES: Record<string, Capabilities> = {
   [none.modelName]: none,
 };
 
+export const isNimoModelName = (modelName: string | null | undefined): boolean =>
+  typeof modelName === "string" && /^nimo(?:$|[-\s])/i.test(modelName.trim())
+
 export const getModelCapabilities = (deviceType: DeviceTypes): Capabilities => {
   const modelName = deviceType as string;
+  // Native/device names include "Nimo-7188" while the saved model is "NIMO".
+  // Normalize only NIMO aliases; preserve every other device's lookup behavior.
+  if (isNimoModelName(modelName)) return nimo
   if (!HARDWARE_CAPABILITIES[modelName]) {
     return HARDWARE_CAPABILITIES[DeviceTypes.NONE];
   }
@@ -209,4 +234,4 @@ export const getModelCapabilities = (deviceType: DeviceTypes): Capabilities => {
 };
 
 // export * from "./capabilities"
-export { simulatedGlasses, evenRealitiesG1, evenRealitiesG2, mentraLive, nimo, vuzixZ100, mentraDisplay };
+export { simulatedGlasses, evenRealitiesG1, evenRealitiesG2, mentraLive, nimo, vuzixZ100, mentraDisplay, s3Watch };

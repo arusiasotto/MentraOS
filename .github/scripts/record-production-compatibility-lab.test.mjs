@@ -22,9 +22,10 @@ const record = {
     manifestUrl: "https://example.com/beta.json",
     manifestSha256: sha("b"),
   },
-  source: {mentraosCommit: sha("a").slice(0, 40), starterKitCommit: sha("c").slice(0, 40)},
+  source: {mentraosCommit: sha("a").slice(0, 40)},
   coordinates: {
     currentMentraApp: {
+      provenance: "coordinated",
       sourceCommit: sha("f").slice(0, 40),
       provenanceUrl: "https://example.com/current.json",
       ios: {marketingVersion: "3.0.0", buildNumber: 100},
@@ -38,10 +39,6 @@ const record = {
       mentraApp: {
         ios: {marketingVersion: "3.1.0", buildNumber: 102},
         android: {marketingVersion: "3.1.0", buildNumber: 102},
-      },
-      starterKit: {
-        ios: {marketingVersion: "3.1.0", buildNumber: 103},
-        android: {marketingVersion: "3.1.0", buildNumber: 103},
       },
     },
   },
@@ -106,17 +103,16 @@ test("records exact non-promotable lab distributions", () => {
   assert.equal(evidence.source.mobileNCommit, record.coordinates.currentMentraApp.sourceCommit)
 })
 
-test("rejects internal-sharing evidence for a different AAB", () => {
-  assert.throws(
-    () =>
-      createCompatibilityLabEvidence({
-        record,
-        plan,
-        mobile,
-        internalSharing: {...sharing, sha256: sha("0")},
-        createdAt: "2026-08-28T21:00:00.000Z",
-        provenanceUrl: "https://github.com/Mentra-Community/MentraOS/actions/runs/2",
-      }),
-    /does not match the built AAB/,
-  )
+test("records Play's generated-artifact digest next to the built AAB digest", () => {
+  const evidence = createCompatibilityLabEvidence({
+    record,
+    plan,
+    mobile,
+    internalSharing: {downloadUrl: sharing.downloadUrl, sha256: sha("0").toUpperCase()},
+    createdAt: "2026-08-28T21:00:00.000Z",
+    provenanceUrl: "https://github.com/Mentra-Community/MentraOS/actions/runs/2",
+  })
+  assert.equal(evidence.android.aabSha256, sha("d"))
+  assert.equal(evidence.android.playArtifactSha256, sha("0"))
+  assert.equal(evidence.android.certificateFingerprint, "")
 })

@@ -20,8 +20,10 @@ public enum DeviceModel: String {
     case frame
     case nimo
     case ar99
+    case s3Watch
     case simulated
     case r1
+    case keyfob
 
     public var deviceType: String {
         switch self {
@@ -43,10 +45,14 @@ public enum DeviceModel: String {
             DeviceTypes.NIMO
         case .ar99:
             DeviceTypes.AR99
+        case .s3Watch:
+            DeviceTypes.S3_WATCH
         case .simulated:
             DeviceTypes.SIMULATED
         case .r1:
             ControllerTypes.R1
+        case .keyfob:
+            ControllerTypes.KEYFOB
         }
     }
 
@@ -70,10 +76,14 @@ public enum DeviceModel: String {
             .nimo
         case DeviceTypes.AR99:
             .ar99
+        case DeviceTypes.S3_WATCH:
+            .s3Watch
         case DeviceTypes.SIMULATED:
             .simulated
         case ControllerTypes.R1:
             .r1
+        case ControllerTypes.KEYFOB:
+            .keyfob
         default:
             .mentraLive
         }
@@ -169,9 +179,17 @@ public struct Device: Identifiable, Equatable, CustomStringConvertible {
 public struct ConnectOptions {
     public let saveAsDefault: Bool
     public let cancelExistingConnectionAttempt: Bool
+    /// Mentra Live on iOS only. Whether CoreBluetooth should require ANCS
+    /// authorization while establishing the connection.
+    public let requiresAncs: Bool
 
-    public init(saveAsDefault: Bool = true, cancelExistingConnectionAttempt: Bool = true) {
+    public init(
+        saveAsDefault: Bool = true,
+        cancelExistingConnectionAttempt: Bool = true,
+        requiresAncs: Bool = true
+    ) {
         self.saveAsDefault = saveAsDefault
         self.cancelExistingConnectionAttempt = cancelExistingConnectionAttempt
+        self.requiresAncs = requiresAncs
     }
 }

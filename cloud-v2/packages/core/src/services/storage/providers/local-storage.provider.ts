@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, normalize } from "node:path";
 import type { PutObjectInput, StorageProvider, StoredObject } from "../storage.service";
 
@@ -9,7 +9,15 @@ export class LocalStorageProvider implements StorageProvider {
   async putObject(input: PutObjectInput): Promise<StoredObject> {
     const path = this.pathForKey(input.key);
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, input.body);
+    // Concurrent identical retries may have observed an unfinished reservation.
+    // Never truncate the final object: only replace it once all new bytes exist.
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, input.body, { flag: "wx" });
+      await rename(temporary, path);
+    } finally {
+      await rm(temporary, { force: true });
+    }
     return {
       key: input.key,
       contentType: input.contentType,
@@ -24,6 +32,23 @@ export class LocalStorageProvider implements StorageProvider {
 
   async deleteObject(key: string): Promise<void> {
     await rm(this.pathForKey(key), { force: true });
+  }
+
+  async putFile(input: { key: string; path: string; contentType: string }): Promise<void> {
+    const path = this.pathForKey(input.key);
+    await mkdir(dirname(path), { recursive: true });
+    await copyFile(input.path, path);
+  }
+
+  async statObject(key: string): Promise<{ sizeBytes: number }> {
+    return { sizeBytes: (await stat(this.pathForKey(key))).size };
+  }
+
+  async streamObject(key: string, range?: { start: number; end: number }): Promise<Blob> {
+    // Keep the lazy file body: Bun serializes Node-backed streams as chunked
+    // responses even with Content-Length, which breaks Safari's media seeking.
+    const file = Bun.file(this.pathForKey(key));
+    return range ? file.slice(range.start, range.end + 1) : file;
   }
 
   private pathForKey(key: string): string {

@@ -46,6 +46,7 @@ import com.mentra.asg_client.camera.policy.PhotoMode;
 import com.mentra.asg_client.camera.request.PreviewRequestConfigurator;
 import com.mentra.asg_client.io.hardware.core.HardwareManagerFactory;
 import com.mentra.asg_client.io.hardware.interfaces.IHardwareManager;
+import com.mentra.asg_client.service.core.constants.BatteryConstants;
 import com.mentra.asg_client.io.media.utils.MediaStorage;
 import com.mentra.asg_client.sensors.ImuRecorder;
 import com.mentra.asg_client.service.system.core.SystemControllerFactory;
@@ -69,9 +70,12 @@ import java.util.Set;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
+import com.mentra.asg_client.camera.policy.CameraFovPolicy;
 
 public class CameraNeoService extends LifecycleService {
     private static final String TAG = "CameraNeo";
+    private static volatile boolean sVideoStartRequested;
 
     private static final String CHANNEL_ID = "CameraNeoServiceChannel";
     private static final int NOTIFICATION_ID = 1;
@@ -96,7 +100,7 @@ public class CameraNeoService extends LifecycleService {
 
     // Camera keep-alive settings
     private static final long CAMERA_KEEP_ALIVE_MS =
-            3000; // Keep camera open for 3 seconds after photo
+            8000; // Keep camera open for 8 seconds after photo
 
     private IHardwareManager hardwareManager;
 
@@ -296,6 +300,16 @@ public class CameraNeoService extends LifecycleService {
     private final PhotoSession.Hooks photoSessionHooks =
             new PhotoSession.Hooks() {
                 @Override
+                public boolean isCameraBatteryLow() {
+                    return BatteryConstants.isCameraBatteryLow(-1, hardwareManager);
+                }
+
+                @Override
+                public IHardwareManager hardwareManager() {
+                    return hardwareManager;
+                }
+
+                @Override
                 public Object serviceLock() {
                     return SERVICE_LOCK;
                 }
@@ -430,6 +444,19 @@ public class CameraNeoService extends LifecycleService {
         void onRecordingError(String videoId, String errorMessage);
     }
 
+    /** Serialize FOV writes with photo/video enqueue and warm-camera lease acquisition. */
+    public static CameraFovPolicy.Result applyFovWhenIdle(
+            CameraFovPolicy policy, int fov, int roi, BooleanSupplier externalCaptureBusy,
+            Runnable write) {
+        synchronized (SERVICE_LOCK) {
+            return policy.apply(fov, roi,
+                    () -> sInstance != null || sVideoStartRequested
+                            || QueuedPhotoRequestQueue.getInstance().size() > 0
+                            || !sPendingWarmCallbacks.isEmpty() || externalCaptureBusy.getAsBoolean(),
+                    write);
+        }
+    }
+
     /**
      * Check if the camera is currently in use for photo capture or video recording. This relies on
      * the service instance being available.
@@ -511,6 +538,27 @@ public class CameraNeoService extends LifecycleService {
     }
 
     /**
+     * Whether an enqueued capture would be dispatched immediately rather than queued behind one
+     * already in flight.
+     *
+     * <p>Deliberately separate from {@link #isCameraWarm}, whose contract is only "this capture
+     * reuses the open session" — a rapid second press is still warm by that definition even though
+     * it queues. Callers that want to act at request time (playing the shutter before any camera
+     * callback arrives) need this stricter reading instead, and it mirrors the {@code
+     * shotState() == IDLE} branch {@code enqueuePhotoRequest} uses to decide the same thing.
+     *
+     * <p>Read under {@code SERVICE_LOCK} for the same reason {@link #isCameraWarm} is: so the
+     * answer is consistent with the state the following enqueue actually observes.
+     */
+    public static boolean isCameraReadyForImmediateCapture() {
+        synchronized (SERVICE_LOCK) {
+            return sInstance != null
+                    && sInstance.cameraCoordinator.hasConfiguredCamera()
+                    && sInstance.photoSession.shotState() == AeStateMachine.ShotState.IDLE;
+        }
+    }
+
+    /**
      * @deprecated Prefer {@link #isCameraWarm(String, boolean, Long, PhotoCaptureSettings)}.
      */
     @Deprecated
@@ -534,6 +582,41 @@ public class CameraNeoService extends LifecycleService {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Close a finished photo session so a paused stream can reopen the camera.
+     *
+     * <p>A stream photo borrows the device from a running WHIP capturer, and the normal post-shot
+     * keep-alive would otherwise hold it for several seconds while the stream shows substitute
+     * frames. Refuses while a shot, queued request, recording, or warm-up lease still needs it.
+     *
+     * @return true once no photo session holds the camera
+     */
+    public static boolean releaseIdleCameraForStream() {
+        synchronized (SERVICE_LOCK) {
+            CameraNeoService service = sInstance;
+            if (service == null) {
+                return true;
+            }
+            if (service.videoSession != null && service.videoSession.isRecording()) {
+                return false;
+            }
+            if (service.photoSession.shotState() != AeStateMachine.ShotState.IDLE
+                    || !QueuedPhotoRequestQueue.getInstance().isEmpty()
+                    || !service.warmLeases.isEmpty()) {
+                return false;
+            }
+            if (service.cameraCoordinator.device() == null
+                    && !service.cameraCoordinator.hasConfiguredCamera()) {
+                return true;
+            }
+            Log.i(TAG, "Closing idle photo camera so the stream can reopen it");
+            service.cancelKeepAliveTimer();
+            service.closeCamera();
+            service.stopSelf();
+            return true;
+        }
     }
 
     /** Cancel an active still capture and synchronously tear down its camera session. */
@@ -568,6 +651,7 @@ public class CameraNeoService extends LifecycleService {
         synchronized (SERVICE_LOCK) {
             Log.d(TAG, "CameraNeoService Camera2 service created");
             sInstance = this;
+            sVideoStartRequested = false;
         }
         Log.i(
                 TAG,
@@ -585,6 +669,11 @@ public class CameraNeoService extends LifecycleService {
     /** Bridges {@link VideoRecordingSession} back into the camera service lifecycle. */
     private final VideoRecordingSession.Hooks videoHooks =
             new VideoRecordingSession.Hooks() {
+                @Override
+                public boolean isCameraBatteryLow() {
+                    return BatteryConstants.isCameraBatteryLow(-1, hardwareManager);
+                }
+
                 @Override
                 public ImuRecorder ensureImuRecorder() {
                     if (mImuRecorder == null) {
@@ -1086,18 +1175,26 @@ public class CameraNeoService extends LifecycleService {
             String filePath,
             VideoSettings settings,
             VideoRecordingCallback callback) {
-        VideoRecordingSession.setPendingVideoCallback(callback);
+        synchronized (SERVICE_LOCK) {
+            VideoRecordingSession.setPendingVideoCallback(callback);
 
-        Intent intent = new Intent(context, CameraNeoService.class);
-        intent.setAction(ACTION_START_VIDEO_RECORDING);
-        intent.putExtra(EXTRA_VIDEO_ID, videoId);
-        intent.putExtra(EXTRA_VIDEO_FILE_PATH, filePath);
-        if (settings != null) {
-            intent.putExtra(EXTRA_VIDEO_SETTINGS + "_width", settings.width);
-            intent.putExtra(EXTRA_VIDEO_SETTINGS + "_height", settings.height);
-            intent.putExtra(EXTRA_VIDEO_SETTINGS + "_fps", settings.fps);
+            Intent intent = new Intent(context, CameraNeoService.class);
+            intent.setAction(ACTION_START_VIDEO_RECORDING);
+            intent.putExtra(EXTRA_VIDEO_ID, videoId);
+            intent.putExtra(EXTRA_VIDEO_FILE_PATH, filePath);
+            if (settings != null) {
+                intent.putExtra(EXTRA_VIDEO_SETTINGS + "_width", settings.width);
+                intent.putExtra(EXTRA_VIDEO_SETTINGS + "_height", settings.height);
+                intent.putExtra(EXTRA_VIDEO_SETTINGS + "_fps", settings.fps);
+            }
+            sVideoStartRequested = true;
+            try {
+                context.startForegroundService(intent);
+            } catch (RuntimeException e) {
+                sVideoStartRequested = false;
+                throw e;
+            }
         }
-        context.startForegroundService(intent);
     }
 
     /**
@@ -1131,6 +1228,7 @@ public class CameraNeoService extends LifecycleService {
                     dispatchNextPhotoRequest();
                     break;
                 case ACTION_START_VIDEO_RECORDING:
+                    sVideoStartRequested = false;
                     {
                         String videoId = intent.getStringExtra(EXTRA_VIDEO_ID);
                         String videoPath = intent.getStringExtra(EXTRA_VIDEO_FILE_PATH);
@@ -1783,6 +1881,8 @@ public class CameraNeoService extends LifecycleService {
                                             videoSession.currentVideoId(),
                                             "Failed to start recording: " + ce.getMessage());
                                     closeCamera();
+                                    VideoRecordingSession.deleteCorruptCapture(
+                                            videoSession.currentVideoPath());
                                     conditionalStopSelf();
                                 }
                             } else {
@@ -1902,6 +2002,7 @@ public class CameraNeoService extends LifecycleService {
             releaseWakeLocks();
 
             sInstance = null;
+            sVideoStartRequested = false;
 
             QueuedPhotoRequestQueue.getInstance()
                     .failAllPending("Camera service terminated unexpectedly");

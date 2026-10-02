@@ -1,3 +1,20 @@
+import {act, render, fireEvent, waitFor} from "@testing-library/react-native"
+import type {ReactNode} from "react"
+import {Platform} from "react-native"
+
+import {engine, SETTINGS} from "@mentra/engine"
+import {useLocalSearchParams} from "expo-router"
+import {focusEffectPreventBack, usePushUnder} from "@/contexts/NavigationHistoryContext"
+import {useNavigationStore} from "@/stores/navigation"
+import {PermissionFeatures, requestFeaturePermissions} from "@/utils/PermissionsUtils"
+import {useNimoCompanionDiscovery} from "@/hooks/pairing/useNimoCompanionDiscovery"
+import SelectGlassesBluetoothScreen from "@/app/pairing/scan"
+import {useCoreStore, useSettingsStore} from "@mentra/engine-host-internal"
+// The glasses store is private to the local engine workspace and has no public test export.
+// eslint-disable-next-line no-restricted-imports
+import {useGlassesStore} from "../../../../modules/engine/src/stores/glasses"
+import {resetBluetoothSdkMock} from "@/test-utils/mockBluetoothSdk"
+
 jest.mock("@mentra/bluetooth-sdk", () => {
   const {bluetoothSdkMock} = require("@/test-utils/mockBluetoothSdk")
   return {
@@ -6,6 +23,8 @@ jest.mock("@mentra/bluetooth-sdk", () => {
     ...bluetoothSdkMock,
   }
 })
+
+jest.mock("@/hooks/pairing/useNimoCompanionDiscovery", () => ({useNimoCompanionDiscovery: jest.fn()}))
 
 jest.mock("expo-router", () => ({
   useLocalSearchParams: jest.fn(),
@@ -100,8 +119,8 @@ jest.mock("@/components/ignite", () => {
   function MockIcon() {
     return <View />
   }
-  function MockHeader() {
-    return <View />
+  function MockHeader({onLeftPress}: {onLeftPress: () => void}) {
+    return <TouchableOpacity accessibilityLabel="common:back" onPress={onLeftPress} />
   }
   function MockScreen({children}: {children: ReactNode}) {
     return <View>{children}</View>
@@ -125,24 +144,6 @@ jest.mock("@/components/ignite", () => {
   }
 })
 
-import {act, render, fireEvent, waitFor} from "@testing-library/react-native"
-import type {ReactNode} from "react"
-import {Platform} from "react-native"
-
-import {engine} from "@mentra/engine"
-import {useLocalSearchParams} from "expo-router"
-import {focusEffectPreventBack, usePushUnder} from "@/contexts/NavigationHistoryContext"
-import {useNavigationStore} from "@/stores/navigation"
-import {requestFeaturePermissions} from "@/utils/PermissionsUtils"
-import SelectGlassesBluetoothScreen from "@/app/pairing/scan"
-import {useCoreStore} from "@mentra/engine-host-internal"
-// The glasses store is private to the local engine workspace and has no public test export.
-// eslint-disable-next-line no-restricted-imports
-import {useGlassesStore} from "../../../../modules/engine/src/stores/glasses"
-import {SETTINGS} from "@mentra/engine"
-import {useSettingsStore} from "@mentra/engine-host-internal"
-import {resetBluetoothSdkMock} from "@/test-utils/mockBluetoothSdk"
-
 const originalPlatformOS = Platform.OS
 
 function setPlatformOS(os: typeof Platform.OS) {
@@ -159,6 +160,7 @@ describe("pairing scan screen", () => {
     process.env.EXPO_PUBLIC_ENABLE_MENTRA_LIVE_SECURE_PAIRING = "true"
     resetBluetoothSdkMock()
     jest.clearAllMocks()
+    ;(engine.pairing.diagnoseEmptyScan as jest.Mock).mockReset().mockResolvedValue(null)
     ;(engine.pairing.pair as jest.Mock).mockReset().mockResolvedValue(undefined)
     useCoreStore.getState().reset()
     useGlassesStore.getState().reset()
@@ -190,7 +192,75 @@ describe("pairing scan screen", () => {
     setPlatformOS(originalPlatformOS)
   })
 
-  it("starts a compatible-device search and routes Mentra Live through btclassic on iOS", async () => {
+  it.each(["", "Even Realities G1"])(
+    "persists iOS NIMO before discovery, replacing pending model %s",
+    async (pending) => {
+      await useSettingsStore.getState().setSetting(SETTINGS.pending_wearable.key, pending, false)
+      ;(useLocalSearchParams as jest.Mock).mockReturnValue({deviceModel: "NIMO"})
+      ;(useNimoCompanionDiscovery as jest.Mock).mockReturnValue({
+        devices: [],
+        requiresSelection: false,
+        needsRetry: false,
+        retry: jest.fn(),
+        select: jest.fn(),
+      })
+      const screen = render(<SelectGlassesBluetoothScreen />)
+      await waitFor(() => {
+        expect(useSettingsStore.getState().getSetting(SETTINGS.pending_wearable.key)).toBe("NIMO")
+      })
+      expect(useSettingsStore.getState().getSetting(SETTINGS.default_wearable.key)).toBe("")
+      expect(replace).not.toHaveBeenCalled()
+      screen.unmount()
+      expect(useSettingsStore.getState().getSetting(SETTINGS.pending_wearable.key)).toBe("NIMO")
+    },
+  )
+
+  it("keeps the remaining NIMO selectable after the chooser has been shown", () => {
+    const device = {id: "nimo-a", name: "Nimo-4027", model: "NIMO", address: "nimo-a"}
+    const select = jest.fn()
+    ;(useLocalSearchParams as jest.Mock).mockReturnValue({deviceModel: "NIMO"})
+    ;(useNimoCompanionDiscovery as jest.Mock).mockReturnValue({
+      devices: [device],
+      requiresSelection: true,
+      needsRetry: false,
+      retry: jest.fn(),
+      select,
+    })
+    const screen = render(<SelectGlassesBluetoothScreen />)
+    expect(screen.getByRole("button", {name: "NIMO, Nimo-4027"})).toBeTruthy()
+    expect(screen.queryByText("onboarding:openSettings")).toBeNull()
+    fireEvent.press(screen.getByTestId("pairing-device-chevron"))
+    expect(select).toHaveBeenCalledWith(device)
+  })
+
+  it.each([false, true])("pairs when tapping the chevron, including after timeout (%s)", async (timedOut) => {
+    jest.useFakeTimers()
+    useCoreStore.setState({
+      searchResults: [
+        {
+          id: "a",
+          model: "Mentra Live",
+          name: "MENTRA_LIVE_BLE_E7FA",
+          address: "a",
+          pairingMode: false,
+          securePairingCapable: true,
+        },
+      ],
+    })
+    const screen = render(<SelectGlassesBluetoothScreen />)
+    if (timedOut) await act(async () => jest.advanceTimersByTime(15_000))
+    // The chevron itself, not the label, must bubble the press to the whole card.
+    fireEvent.press(screen.getByTestId("pairing-device-chevron"))
+    // This idle device shows pairing-mode help, proving the row's handler ran.
+    expect(require("@/utils/AlertUtils").default).toHaveBeenCalledWith(
+      "pairing:notInPairingModeAlertTitle",
+      "pairing:notInPairingModeAlertMessage",
+      [{text: "OK"}],
+    )
+  })
+
+  it("routes Mentra Live through btclassic on iOS even without phone microphone permission", async () => {
+    ;(requestFeaturePermissions as jest.Mock).mockResolvedValue(false)
     useCoreStore.setState({
       searchResults: [
         {id: "a", model: "Mentra Live", name: "MENTRA_LIVE_BLE_001", address: "a"},
@@ -218,6 +288,8 @@ describe("pairing scan screen", () => {
       })
     })
 
+    expect(requestFeaturePermissions).not.toHaveBeenCalled()
+
     // Two-phase identity: picking a device must NOT write the default identity —
     // the scan marks the model pending and the native layer promotes on success.
     expect(engine.pairing.setDefault).not.toHaveBeenCalled()
@@ -239,10 +311,9 @@ describe("pairing scan screen", () => {
     // No entry snapshot: the abandon decision must come from the LIVE
     // default-device read, because a pairing can promote while the flow is
     // open - an entry snapshot would forget that brand-new pairing.
-    render(<SelectGlassesBluetoothScreen />)
-
-    const backHandler = (focusEffectPreventBack as jest.Mock).mock.calls[0][0]
-    backHandler({actionType: "GO_BACK"})
+    const screen = render(<SelectGlassesBluetoothScreen />)
+    expect(screen.queryByText("common:cancel")).toBeNull()
+    fireEvent.press(screen.getByLabelText("common:back"))
 
     await waitFor(() => {
       expect(engine.pairing.abandonAttempt).toHaveBeenCalledWith()
@@ -261,7 +332,10 @@ describe("pairing scan screen", () => {
     expect(goBack).not.toHaveBeenCalled()
   })
 
-  it("hands the exact selected device to loading without connecting from the scan screen", async () => {
+  it("hands the selected device to loading on Android without microphone permission", async () => {
+    ;(requestFeaturePermissions as jest.Mock).mockImplementation(
+      async (feature) => feature !== PermissionFeatures.MICROPHONE,
+    )
     jest.useFakeTimers()
     setPlatformOS("android")
     useCoreStore.setState({
@@ -288,6 +362,7 @@ describe("pairing scan screen", () => {
       jest.advanceTimersByTime(3_000)
     })
     expect(engine.pairing.pair).not.toHaveBeenCalled()
+    expect(requestFeaturePermissions).not.toHaveBeenCalledWith(PermissionFeatures.MICROPHONE)
   })
 
   it("auto-skips directly into pairing when NOTREQUIREDSKIP is discovered", async () => {
@@ -353,6 +428,45 @@ describe("pairing scan screen", () => {
     } finally {
       jest.useRealTimers()
     }
+  })
+
+  it("shows a connected-device advisory after an empty scan and clears it on retry", async () => {
+    jest.useFakeTimers()
+    setPlatformOS("android")
+    ;(engine.pairing.diagnoseEmptyScan as jest.Mock).mockResolvedValue({
+      code: "device_connected_on_phone",
+      message: "Matching glasses are connected",
+    })
+    const {getByText, queryByText} = render(<SelectGlassesBluetoothScreen />)
+    await act(async () => {
+      jest.advanceTimersByTime(15_000)
+    })
+    expect(getByText("pairing:connectedOnPhoneTitle")).toBeTruthy()
+    expect(getByText("pairing:connectedOnPhoneHint")).toBeTruthy()
+    await act(async () => {
+      fireEvent.press(getByText("pairing:tryAgain"))
+    })
+    expect(queryByText("pairing:connectedOnPhoneTitle")).toBeNull()
+  })
+
+  it("ignores an old advisory lookup after Scan Again starts a new scan", async () => {
+    jest.useFakeTimers()
+    setPlatformOS("android")
+    let resolveDiagnostic!: (value: unknown) => void
+    ;(engine.pairing.diagnoseEmptyScan as jest.Mock).mockReturnValue(
+      new Promise((resolve) => {
+        resolveDiagnostic = resolve
+      }),
+    )
+    const {getByText, queryByText} = render(<SelectGlassesBluetoothScreen />)
+    await act(async () => {
+      jest.advanceTimersByTime(15_000)
+    })
+    fireEvent.press(getByText("pairing:scanAgain"))
+    await act(async () => {
+      resolveDiagnostic({code: "device_connected_on_phone", message: "Old scan"})
+    })
+    expect(queryByText("pairing:connectedOnPhoneTitle")).toBeNull()
   })
 
   it("Scan Again restarts scan in place without navigating back", async () => {
@@ -752,5 +866,24 @@ describe("pairing scan screen", () => {
     })
 
     expect(queryByText("Xingyi AR99")).toBeNull()
+  })
+
+  it("filters ESP32-S3 Watch scan results by device model", async () => {
+    ;(useLocalSearchParams as jest.Mock).mockReturnValue({deviceModel: "ESP32-S3 Watch"})
+    useCoreStore.setState({
+      searchResults: [
+        {id: "watch", model: "ESP32-S3 Watch", name: "S3Watch-CEC5BA", address: "AA:BB:CC:DD:EE:66"},
+        {id: "g1", model: "Even Realities G1", name: "G1_123", address: "AA:BB:CC:DD:EE:77"},
+      ],
+    })
+
+    const {getByText, queryByText} = render(<SelectGlassesBluetoothScreen />)
+
+    await waitFor(() => {
+      expect(engine.pairing.scan).toHaveBeenCalledWith("ESP32-S3 Watch")
+    })
+
+    expect(getByText("S3Watch-CEC5BA")).toBeTruthy()
+    expect(queryByText("G1_123")).toBeNull()
   })
 })

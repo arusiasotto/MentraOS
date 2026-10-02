@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import {createHash} from "node:crypto"
-import {execFileSync} from "node:child_process"
+import {execFileSync, spawnSync} from "node:child_process"
 import {mkdirSync, readFileSync, writeFileSync} from "node:fs"
 import path from "node:path"
 import {fileURLToPath} from "node:url"
@@ -60,9 +60,94 @@ function parseArgs(args) {
   return values
 }
 
+export function isNpmConflictError(message) {
+  return /npm error code E409\b|\b409 Conflict\b/.test(message)
+}
+
+// A large publish that npm is still processing (see the read-back notes
+// below) is invisible to `npm view` but already occupies its version: a
+// second publish of the same version is refused with
+// `409 Conflict - Cannot publish over previously staged version "X.Y.Z"`.
+// Seen 2026-09-14 for @mentra/bluetooth-sdk@3.1.1 (runs 34829440530 and
+// 34833322934): the first run gave up waiting for the metadata, the re-run
+// hit the conflict on every attempt. Report the staged version so the caller
+// can treat an exact match as published and wait for the read-back instead.
+export function npmStagedVersionConflict(message) {
+  if (!isNpmConflictError(message)) return null
+  const match = /Cannot publish over previously staged version "([^"]+)"/.exec(message)
+  return match ? match[1] : null
+}
+
+function versionOfCoordinate(coordinate) {
+  return coordinate.slice(coordinate.lastIndexOf("@") + 1)
+}
+
+// npm publish --provenance mints a Sigstore signing certificate from
+// fulcio.sigstore.dev, so a blip reaching that CA fails the publish and, with
+// it, the coordinated release: seen 2026-09-08 as
+// CA_CREATE_SIGNING_CERTIFICATE_ERROR / "read ECONNRESET". Retry, and treat a
+// version that turns up on the registry with the bytes we packed as published,
+// because a publish can also fail after the tarball has already landed. A 409
+// conflict is never transient: the exact version already staged on npm counts
+// as published (the read-back then confirms the bytes); any other conflict
+// fails immediately.
+export function publishWithRetry(
+  coordinate,
+  integrity,
+  {attempts = 4, publish, registryIntegrityOf, sleep = () => execFileSync("sleep", ["15"]), log = console.log},
+) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      publish()
+      return "published"
+    } catch (error) {
+      let landed = null
+      try {
+        landed = registryIntegrityOf(coordinate)
+      } catch (viewError) {
+        log(`npm view of ${coordinate} failed during publish recovery: ${viewError.message}`)
+      }
+      if (landed !== null) {
+        if (landed !== integrity) throw new Error(`${coordinate} already exists on npm with different bytes`)
+        return "published"
+      }
+      const stagedVersion = npmStagedVersionConflict(error.message)
+      if (stagedVersion === versionOfCoordinate(coordinate)) {
+        log(`npm already holds ${coordinate} as a staged publish; waiting for the registry to expose it`)
+        return "published"
+      }
+      if (isNpmConflictError(error.message)) {
+        throw new Error(
+          `npm refused ${coordinate} with a conflict that is not its own staged version: ${error.message}`,
+        )
+      }
+      if (attempt === attempts) throw error
+      log(`npm publish of ${coordinate} failed (attempt ${attempt}/${attempts}); retrying: ${error.message}`)
+      sleep()
+    }
+  }
+  throw new Error(`${coordinate} was not published`)
+}
+
 function run(command, args, options = {}) {
   console.log(`$ ${command} ${args.join(" ")}`)
   return execFileSync(command, args, {stdio: "inherit", ...options})
+}
+
+// Like run, but keeps the command's output in the thrown error so the caller
+// can read npm's error code and message (an inherited stdio leaves only
+// "Command failed"). The output is still echoed to the job log.
+function runCapturingOutput(command, args, options = {}) {
+  console.log(`$ ${command} ${args.join(" ")}`)
+  const result = spawnSync(command, args, {encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], ...options})
+  process.stdout.write(result.stdout || "")
+  process.stderr.write(result.stderr || "")
+  if (result.error) throw result.error
+  if (result.status !== 0) {
+    const exit = result.status === null ? `signal ${result.signal}` : `exit code ${result.status}`
+    throw new Error(`${command} ${args.join(" ")} failed with ${exit}\n${result.stderr || ""}`)
+  }
+  return result
 }
 
 function npmView(spec, field) {
@@ -91,14 +176,49 @@ export function isHttpsRegistryUrl(value) {
   return typeof value === "string" && value.startsWith("https://")
 }
 
+// npm processes a large publish asynchronously ("Your package is being
+// processed and may take a few minutes to become available"), and the
+// metadata read-back keeps returning nothing until that finishes. Seen
+// 2026-09-10 in the beta 3.1.0-beta.192 release: the 18.5 MB
+// @mentra/bluetooth-sdk tarball published fine but was still invisible after
+// the previous 10-minute bound, so the job failed and only a re-run recovered
+// it through the "reused" path. Wait at least 30 minutes, and longer for
+// bigger tarballs, before treating the missing metadata as a failure.
+export const NPM_READBACK_POLL_SECONDS = 5
+export const NPM_READBACK_MIN_WAIT_SECONDS = 30 * 60
+export const NPM_READBACK_SECONDS_PER_MEBIBYTE = 2 * 60
+
+export function npmReadbackWaitSeconds(tarballBytes = 0) {
+  const mebibytes = Math.ceil(Math.max(0, Number(tarballBytes) || 0) / (1024 * 1024))
+  return Math.max(NPM_READBACK_MIN_WAIT_SECONDS, mebibytes * NPM_READBACK_SECONDS_PER_MEBIBYTE)
+}
+
+export function npmReadbackAttempts(tarballBytes = 0) {
+  return Math.ceil(npmReadbackWaitSeconds(tarballBytes) / NPM_READBACK_POLL_SECONDS) + 1
+}
+
 export function npmViewPublishedTarball(
   spec,
-  {attempts = 120, view = npmView, sleep = () => execFileSync("sleep", ["5"])} = {},
+  {
+    tarballBytes = 0,
+    attempts = npmReadbackAttempts(tarballBytes),
+    view = npmView,
+    sleep = () => execFileSync("sleep", [String(NPM_READBACK_POLL_SECONDS)]),
+    log = console.log,
+  } = {},
 ) {
+  const progressEvery = Math.max(1, Math.round((5 * 60) / NPM_READBACK_POLL_SECONDS))
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     const value = parseViewValue(view(spec, "dist.tarball"))
     if (isHttpsRegistryUrl(value)) return value
-    if (attempt < attempts) sleep()
+    if (attempt < attempts) {
+      sleep()
+      if (attempt % progressEvery === 0) {
+        const waited = attempt * NPM_READBACK_POLL_SECONDS
+        const bound = (attempts - 1) * NPM_READBACK_POLL_SECONDS
+        log(`npm has not exposed ${spec} yet; waited ${waited}s of up to ${bound}s`)
+      }
+    }
   }
   return null
 }
@@ -359,15 +479,28 @@ export function publishReleaseNpm({
       }
       status = "reused"
     } else if (!dryRun) {
-      run("npm", ["publish", tarball, "--tag", tag, "--access", "public", "--provenance"], {cwd: rootDir})
-      status = "published"
+      status = publishWithRetry(coordinate, integrity, {
+        publish: () =>
+          runCapturingOutput("npm", ["publish", tarball, "--tag", tag, "--access", "public", "--provenance"], {
+            cwd: rootDir,
+          }),
+        registryIntegrityOf: (spec) => parseViewValue(npmView(spec, "dist.integrity")),
+      })
     }
 
     let url = `https://registry.npmjs.org/${encodeURIComponent(name)}`
     if (!dryRun) {
-      const registryUrl = npmViewPublishedTarball(coordinate)
+      const registryUrl = npmViewPublishedTarball(coordinate, {tarballBytes: bytes.length})
       if (!isHttpsRegistryUrl(registryUrl)) {
-        throw new Error(`${coordinate} was published but has no HTTPS registry tarball URL`)
+        throw new Error(
+          `${coordinate} was published but has no HTTPS registry tarball URL after ${npmReadbackWaitSeconds(bytes.length)}s`,
+        )
+      }
+      // The read-back is the only proof for a publish npm accepted as an
+      // already-staged version, so confirm the exposed bytes are ours.
+      const exposedIntegrity = parseViewValue(npmView(coordinate, "dist.integrity"))
+      if (exposedIntegrity !== integrity) {
+        throw new Error(`${coordinate} is exposed on npm with different bytes (${exposedIntegrity})`)
       }
       url = registryUrl
     }

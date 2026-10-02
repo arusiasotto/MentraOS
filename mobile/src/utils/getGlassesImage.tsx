@@ -68,6 +68,10 @@ export const getGlassesImage = (glasses: string | null) => {
     case "AR99":
     case "Xingyi AR99":
       return require("../../assets/glasses/ar99_display.png")
+    case DeviceTypes.S3_WATCH:
+    case "ESP32-S3 Watch":
+    case "esp32-s3-watch":
+      return require("../../assets/glasses/s3_watch.png")
     case "virtual-wearable":
     case "Audio Wearable":
       return require("../../assets/glasses/audio_wearable.png")
@@ -82,6 +86,10 @@ export const getGlassesImage = (glasses: string | null) => {
       return require("../../assets/glasses/frame.png")
     case "Even Realities R1":
       return require("../../assets/glasses/even_realities/r1/ring.png")
+    case "XIAO Keyfob":
+    case "xiao_keyfob":
+    case "keyfob":
+      return require("../../assets/glasses/xiao_keyfob.png")
     default:
       return require("../../assets/glasses/g1.png")
   }

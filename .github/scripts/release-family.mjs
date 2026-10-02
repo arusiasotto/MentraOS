@@ -3,6 +3,9 @@ import {createHash} from "node:crypto"
 import path from "node:path"
 
 import {validateCloudV2DeploymentRecord} from "./coordinated-cloud-v2-records.mjs"
+import {validatePrivateDeploymentRecord} from "./coordinated-private-deployment-records.mjs"
+import {validateRuntimeImageRecord} from "./coordinated-runtime-image-records.mjs"
+import {validateMentraosTestflightDistribution} from "./mentraos-testflight-distribution.mjs"
 
 const STABLE_VERSION_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/
@@ -69,6 +72,77 @@ export function validateFamilyBaseVersion(version) {
     fail(`family base version ${JSON.stringify(version)} must be a plain X.Y.Z version`)
   }
   return version
+}
+
+// Every store build number in the family (the Mentra App's iOS build and
+// Android versionCode, and the ASG client's versionCode) derives from the family
+// base version, so a number says which release it belongs to and every channel
+// of a family orders naturally: MAJOR*100_000_000 + MINOR*1_000_000 +
+// PATCH*10_000 + SEQUENCE. Dev and beta use the coordinated run number as the
+// sequence; production takes the next free sequence above everything the
+// stores already hold for the family. MINOR and PATCH are limited to 99 so the
+// windows never overlap, and MAJOR to 20 so codes stay under Android's
+// 2,100,000,000 limit. Two legacy namespaces sit below every family window:
+// the timestamp scheme of the pre-coordinated releases (below 60 million) and
+// the first coordinated allocator's 100_000_000 + run number. The Mentra App's
+// 3.1.0 betas and early 3.2.0 dev builds used a flat 310_000_000 + run number
+// and sit above their families' windows; testers on those Android builds
+// reinstall once to rejoin the release train.
+export const BUILD_NUMBER_MAJOR_WEIGHT = 100_000_000
+export const BUILD_NUMBER_MINOR_WEIGHT = 1_000_000
+export const BUILD_NUMBER_PATCH_WEIGHT = 10_000
+export const BUILD_NUMBER_MAX_SEQUENCE = BUILD_NUMBER_PATCH_WEIGHT - 1
+// Release channels (dev, beta, production) allocate sequences from this band;
+// the sequences above it are reserved for local and pull-request builds, which
+// must always outrank every release of their family.
+export const BUILD_NUMBER_RELEASE_SEQUENCE_LIMIT = 2_999
+
+export function familyBuildNumberPrefix(baseVersion) {
+  const match = STABLE_VERSION_PATTERN.exec(typeof baseVersion === "string" ? baseVersion : "")
+  if (!match) throw new Error(`Family base version ${JSON.stringify(baseVersion)} must be a plain X.Y.Z version`)
+  const [major, minor, patch] = match.slice(1).map(Number)
+  if (major < 2 || major > 20) throw new Error(`Family base version major ${major} must be between 2 and 20`)
+  if (minor > 99) throw new Error(`Family base version minor ${minor} must be at most 99`)
+  if (patch > 99) throw new Error(`Family base version patch ${patch} must be at most 99`)
+  return major * BUILD_NUMBER_MAJOR_WEIGHT + minor * BUILD_NUMBER_MINOR_WEIGHT + patch * BUILD_NUMBER_PATCH_WEIGHT
+}
+
+// Local and pull-request builds of the app and the ASG client take a sequence
+// above every release of their family, derived from the HEAD commit's
+// committer time so that the app and the ASG client built from the same commit
+// share a number without any shared counter. Minutes wrap the band every 4.9
+// days, which covers iterating on a pull request with glasses attached.
+export const BUILD_NUMBER_NON_RELEASE_SEQUENCE_BASE = 3_000
+const BUILD_NUMBER_NON_RELEASE_SEQUENCE_SPAN = BUILD_NUMBER_MAX_SEQUENCE - BUILD_NUMBER_NON_RELEASE_SEQUENCE_BASE + 1
+const BUILD_NUMBER_EPOCH_SECONDS = Date.UTC(2025, 0, 1) / 1000
+
+export function nonReleaseBuildSequence(committerEpochSeconds) {
+  if (!Number.isSafeInteger(committerEpochSeconds) || committerEpochSeconds < BUILD_NUMBER_EPOCH_SECONDS) {
+    throw new Error(`Commit time ${JSON.stringify(committerEpochSeconds)} must be a Unix time on or after 2025-01-01`)
+  }
+  const minutes = Math.floor((committerEpochSeconds - BUILD_NUMBER_EPOCH_SECONDS) / 60)
+  return BUILD_NUMBER_NON_RELEASE_SEQUENCE_BASE + (minutes % BUILD_NUMBER_NON_RELEASE_SEQUENCE_SPAN)
+}
+
+export function nonReleaseBuildNumber(baseVersion, committerEpochSeconds) {
+  return familyBuildNumber(baseVersion, nonReleaseBuildSequence(committerEpochSeconds))
+}
+
+export function familyBuildNumberWindow(baseVersion) {
+  const prefix = familyBuildNumberPrefix(baseVersion)
+  return {prefix, first: prefix + 1, last: prefix + BUILD_NUMBER_MAX_SEQUENCE}
+}
+
+export function familyBuildNumber(baseVersion, sequence) {
+  if (!Number.isSafeInteger(sequence) || sequence < 1 || sequence > BUILD_NUMBER_MAX_SEQUENCE) {
+    throw new Error(`Build sequence ${JSON.stringify(sequence)} must be between 1 and ${BUILD_NUMBER_MAX_SEQUENCE}`)
+  }
+  return familyBuildNumberPrefix(baseVersion) + sequence
+}
+
+export function buildNumberBelongsTo(baseVersion, buildNumber) {
+  const window = familyBuildNumberWindow(baseVersion)
+  return Number.isSafeInteger(buildNumber) && buildNumber >= window.first && buildNumber <= window.last
 }
 
 export function channelForBranch(branch) {
@@ -243,15 +317,38 @@ export function loadReleaseFamily({rootDir = process.cwd(), requireVersionMirror
   }
 }
 
-export function createReleasePlan({family, channel, sequence, sourceCommit, nativeBuildNumber, otaInputs = {}}) {
+export function createReleasePlan({
+  family,
+  channel,
+  sequence,
+  sourceCommit,
+  nativeBuildNumber,
+  otaInputs = {},
+  publicBetaTestflight = false,
+  uploadGooglePlay = true,
+  playTrack = DEFAULT_PLAY_TRACKS[channel],
+}) {
   if (!family?.members || !family?.familyBaseVersion) throw new Error("A validated release family is required")
+  if (typeof playTrack !== "string" || !/^[a-z][a-z0-9-]*$/.test(playTrack)) {
+    throw new Error(`Invalid Google Play track ${JSON.stringify(playTrack)}`)
+  }
   const changelog = validateChangelog(family.changelog, family.familyBaseVersion)
   if (!CHANNELS.has(channel)) throw new Error(`Unknown release channel ${JSON.stringify(channel)}`)
+  if (typeof uploadGooglePlay !== "boolean" || (!uploadGooglePlay && channel !== "dev")) {
+    throw new Error("Google Play uploads may only be disabled for dev releases")
+  }
   if (typeof sourceCommit !== "string" || !COMMIT_PATTERN.test(sourceCommit)) {
     throw new Error("sourceCommit must be a full lowercase Git commit SHA")
   }
-  if (!Number.isSafeInteger(nativeBuildNumber) || nativeBuildNumber < 1) {
-    throw new Error("nativeBuildNumber must be a positive safe integer")
+  if (!buildNumberBelongsTo(family.familyBaseVersion, nativeBuildNumber)) {
+    throw new Error(
+      `nativeBuildNumber ${JSON.stringify(nativeBuildNumber)} does not belong to family ${family.familyBaseVersion}`,
+    )
+  }
+  if (nativeBuildNumber - familyBuildNumberPrefix(family.familyBaseVersion) > BUILD_NUMBER_RELEASE_SEQUENCE_LIMIT) {
+    throw new Error(
+      `nativeBuildNumber ${nativeBuildNumber} is outside the release band of family ${family.familyBaseVersion}`,
+    )
   }
 
   const releaseIdentity = deriveReleaseIdentity(family.familyBaseVersion, channel, sequence)
@@ -262,7 +359,10 @@ export function createReleasePlan({family, channel, sequence, sourceCommit, nati
         version: releaseIdentity,
         kind: member.kind,
         manifest: member.manifest,
-        publishTargets: member.publishTargets,
+        publishTargets:
+          member.name === "mentraos" && !uploadGooglePlay
+            ? member.publishTargets.filter((target) => target !== "google-play")
+            : member.publishTargets,
         dependencies: Object.fromEntries(member.dependencies.map((dependency) => [dependency, releaseIdentity])),
         privateWorkspaceDependencies: member.privateWorkspaceDependencies,
       },
@@ -285,6 +385,12 @@ export function createReleasePlan({family, channel, sequence, sourceCommit, nati
     native: {
       marketingVersion: family.familyBaseVersion,
       buildNumber: nativeBuildNumber,
+      // The Play destination is frozen in the plan; the record must publish there.
+      playTrack,
+      ...(!uploadGooglePlay ? {googlePlayUpload: false} : {}),
+      ...(channel === "beta" && publicBetaTestflight
+        ? {testflight: {group: "Mentra Staging Public", audience: "external"}}
+        : {}),
     },
     products: Object.fromEntries(family.products.map((product) => [product, releaseIdentity])),
     members,
@@ -353,21 +459,67 @@ function validatePublication(publication, label) {
   return publication
 }
 
-function expectedPublicationCoordinate(plan, memberName, target) {
+// Where each channel publishes on Google Play unless the plan says otherwise.
+export const DEFAULT_PLAY_TRACKS = Object.freeze({dev: "internal", beta: "beta", production: "production"})
+// Plans made before the destination was frozen published betas to Internal App
+// Sharing for a while (#4037); their archived records still validate.
+const LEGACY_PLAY_TRACKS = Object.freeze({
+  dev: ["internal"],
+  beta: ["beta", "internal-app-sharing"],
+  production: ["production"],
+})
+
+export function expectedPlayTracks(plan) {
+  if (plan.native?.playTrack !== undefined) return [plan.native.playTrack]
+  return LEGACY_PLAY_TRACKS[plan.channel] ?? []
+}
+
+// Google Play's largest accepted version code.
+export const ANDROID_MAX_VERSION_CODE = 2_100_000_000
+
+// The Android build may carry a testing track's floor plus one instead of the
+// family number (see resolve-android-version-code.mjs); the results say so.
+export function androidBuildNumberOf(plan, results) {
+  const declared = results?.native?.androidBuildNumber
+  if (declared === undefined) return plan.native.buildNumber
+  if (!Number.isSafeInteger(declared) || declared < plan.native.buildNumber) {
+    throw new Error(`native.androidBuildNumber ${JSON.stringify(declared)} is below the family build number`)
+  }
+  if (declared > ANDROID_MAX_VERSION_CODE) {
+    throw new Error(`native.androidBuildNumber ${declared} exceeds ${ANDROID_MAX_VERSION_CODE}`)
+  }
+  return declared
+}
+
+function expectedPublicationCoordinate(plan, memberName, target, results) {
   const version = plan.members[memberName].version
   if (target === "npm") return `${memberName}@${version}`
   if (target === "maven-central") return `com.mentraglass:bluetooth-sdk:${version}`
   if (target === "swift-package-manager") return `Mentra-Community/mentra-bluetooth-sdk-ios@${version}`
   const channels = {
-    dev: {play: "internal", appStore: "Mentra Dev"},
-    beta: {play: "beta", appStore: "Mentra Staging"},
-    production: {play: "production", appStore: "App Store"},
+    dev: {appStore: "Mentra Dev"},
+    beta: {appStore: "Mentra Staging"},
+    production: {appStore: "App Store"},
   }
   const selected = channels[plan.channel]
   if (!selected) throw new Error(`Unknown release channel ${JSON.stringify(plan.channel)}`)
-  if (target === "google-play") return `com.mentra.mentra:${plan.native.buildNumber}:${selected.play}`
+  if (target === "google-play") {
+    const code = androidBuildNumberOf(plan, results)
+    const tracks = expectedPlayTracks(plan)
+    // A record names one destination; a legacy plan allows its historical ones.
+    const actual = results?.publications?.[memberName]?.[target]?.coordinate
+    const track = tracks.find((candidate) => actual === `com.mentra.mentra:${code}:${candidate}`) ?? tracks[0]
+    return `com.mentra.mentra:${code}:${track}`
+  }
   if (target === "app-store-connect") {
-    return `com.mentra.mentra:${plan.native.marketingVersion}:${plan.native.buildNumber}:${selected.appStore}`
+    const group = plan.native.testflight?.group || selected.appStore
+    if (
+      plan.native.testflight &&
+      (plan.channel !== "beta" || group !== "Mentra Staging Public" || plan.native.testflight.audience !== "external")
+    ) {
+      throw new Error("Invalid MentraOS public TestFlight policy")
+    }
+    return `com.mentra.mentra:${plan.native.marketingVersion}:${plan.native.buildNumber}:${group}`
   }
   throw new Error(`Unknown publication target ${JSON.stringify(target)}`)
 }
@@ -386,122 +538,6 @@ function requiredArtifactCoordinates(plan) {
   })
 }
 
-function validateStarterKitEvidence(plan, starterKit, artifacts) {
-  if (starterKit === undefined) return undefined
-  if (
-    starterKit?.schemaVersion !== 1 ||
-    starterKit.releaseSetId !== plan.releaseSetId ||
-    starterKit.releaseIdentity !== plan.releaseIdentity ||
-    starterKit.familyBaseVersion !== plan.familyBaseVersion ||
-    starterKit.channel !== plan.channel ||
-    starterKit.mentraos?.sourceCommit !== plan.sourceCommit ||
-    !Array.isArray(starterKit.artifacts) ||
-    ![3, 4].includes(starterKit.artifacts.length)
-  ) {
-    throw new Error("Starter Kit evidence does not match the release plan")
-  }
-  requirePublicHttpsUrl(starterKit.resultUrl, "starterKit.resultUrl")
-  requirePublicHttpsUrl(starterKit.starterKit?.releaseUrl, "starterKit.starterKit.releaseUrl")
-  requirePublicHttpsUrl(starterKit.starterKit?.pullRequestUrl, "starterKit.starterKit.pullRequestUrl")
-  requirePublicHttpsUrl(starterKit.starterKit?.validationRunUrl, "starterKit.starterKit.validationRunUrl")
-
-  const artifactByCoordinate = new Map(artifacts.map((artifact) => [artifact.coordinate, artifact]))
-  for (const example of starterKit.artifacts) {
-    const artifact = artifactByCoordinate.get(example.name)
-    if (
-      !artifact ||
-      artifact.url !== example.url ||
-      artifact.sha256 !== example.sha256 ||
-      artifact.size !== example.size
-    ) {
-      throw new Error(`Starter Kit artifact ${example.name || "<unknown>"} differs from publication evidence`)
-    }
-  }
-  const expectedGroup = plan.channel === "dev" ? "Mentra Dev" : "Mentra Staging Public"
-  const expectedAudience = plan.channel === "dev" ? "internal" : "external"
-  const testflight = starterKit.testflight
-  if (
-    testflight?.schemaVersion !== 1 ||
-    testflight.releaseSetId !== plan.releaseSetId ||
-    testflight.releaseIdentity !== plan.releaseIdentity ||
-    testflight.channel !== plan.channel ||
-    testflight.mentraosSourceCommit !== plan.sourceCommit ||
-    testflight.starterKitReleaseCommit !== starterKit.starterKit?.releaseCommit ||
-    testflight.app?.id !== "6792839366" ||
-    testflight.app?.bundleId !== "com.mentra.bluetoothsdkexample" ||
-    testflight.version?.marketingVersion !== plan.native.marketingVersion ||
-    testflight.version?.buildNumber !== plan.native.buildNumber ||
-    testflight.build?.processingState !== "VALID" ||
-    !["published", "reused"].includes(testflight.build?.uploadStatus) ||
-    typeof testflight.build?.id !== "string" ||
-    testflight.build.id.length === 0 ||
-    testflight.group?.name !== expectedGroup ||
-    typeof testflight.group?.id !== "string" ||
-    testflight.group.id.length === 0 ||
-    testflight.distribution?.audience !== expectedAudience ||
-    !["available", "submitted", "skipped"].includes(testflight.distribution?.status) ||
-    !/^https:\/\//.test(testflight.distribution?.installUrl || "")
-  ) {
-    throw new Error("Starter Kit TestFlight evidence does not match the release plan")
-  }
-  if (plan.channel === "dev" && testflight.distribution.status !== "available") {
-    throw new Error("Internal Starter Kit TestFlight distribution must be available")
-  }
-  if (
-    expectedAudience === "external" &&
-    !/^https:\/\/testflight\.apple\.com\/join\//.test(testflight.distribution.installUrl)
-  ) {
-    throw new Error("External Starter Kit TestFlight distribution must use a public invitation link")
-  }
-  if (testflight.distribution.status === "skipped" && !testflight.distribution.skipReason) {
-    throw new Error("Skipped Starter Kit TestFlight distribution must identify its reason")
-  }
-  if (
-    testflight.ipa !== undefined &&
-    (!SHA256_PATTERN.test(testflight.ipa.sha256 || "") ||
-      !Number.isSafeInteger(testflight.ipa.size) ||
-      testflight.ipa.size < 1)
-  ) {
-    throw new Error("Starter Kit TestFlight IPA evidence is invalid")
-  }
-  requirePublicHttpsUrl(testflight.provenanceUrl, "starterKit.testflight.provenanceUrl")
-  return starterKit
-}
-
-function validateProductionExampleTestflight(plan, testflight) {
-  if (plan.channel !== "production") return undefined
-  if (
-    testflight?.schemaVersion !== 1 ||
-    testflight.releaseSetId !== plan.releaseSetId ||
-    testflight.releaseIdentity !== plan.releaseIdentity ||
-    testflight.channel !== "production" ||
-    testflight.selectedBetaReleaseSetId !== plan.promotion?.selectedBetaReleaseSetId ||
-    testflight.selectedBetaIdentity !== plan.promotion?.selectedBetaIdentity ||
-    testflight.app?.id !== "6792839366" ||
-    testflight.app?.bundleId !== "com.mentra.bluetoothsdkexample" ||
-    testflight.version?.marketingVersion !== plan.native?.marketingVersion ||
-    testflight.version?.buildNumber !== plan.native?.buildNumber ||
-    testflight.build?.processingState !== "VALID" ||
-    testflight.group?.name !== "Mentra Production Public" ||
-    testflight.distribution?.audience !== "external" ||
-    testflight.distribution?.status !== "available" ||
-    testflight.distribution?.reviewState !== "APPROVED"
-  ) {
-    throw new Error("Production example TestFlight evidence does not match the release plan")
-  }
-  requireString(testflight.build.id, "exampleTestflight.build.id")
-  requireString(testflight.group.id, "exampleTestflight.group.id")
-  requirePublicHttpsUrl(
-    testflight.build.sourceTestflightProvenanceUrl,
-    "exampleTestflight.build.sourceTestflightProvenanceUrl",
-  )
-  requirePublicHttpsUrl(testflight.provenanceUrl, "exampleTestflight.provenanceUrl")
-  if (!/^https:\/\/testflight\.apple\.com\/join\//.test(testflight.distribution.installUrl || "")) {
-    throw new Error("Production example TestFlight distribution must use a public invitation link")
-  }
-  return testflight
-}
-
 export function finalizeReleaseManifest({plan, results, completedAt}) {
   if (!plan?.releaseSetId || !plan?.members) throw new Error("A generated release plan is required")
   if (results?.releaseSetId !== plan.releaseSetId) throw new Error("Publication results do not match the release set")
@@ -517,6 +553,7 @@ export function finalizeReleaseManifest({plan, results, completedAt}) {
     throw new Error("Release plan has invalid native build identity")
   }
   const changelog = validateChangelog(plan.changelog, plan.familyBaseVersion)
+  const androidBuildNumber = androidBuildNumberOf(plan, results)
 
   const publications = {}
   for (const [memberName, member] of Object.entries(plan.members)) {
@@ -528,9 +565,12 @@ export function finalizeReleaseManifest({plan, results, completedAt}) {
     for (const target of member.publishTargets) {
       const label = `publications.${memberName}.${target}`
       const publication = validatePublication(memberResults[target], label)
-      const expected = expectedPublicationCoordinate(plan, memberName, target)
+      const expected = expectedPublicationCoordinate(plan, memberName, target, results)
       if (publication.coordinate !== expected) {
         throw new Error(`${label}.coordinate must be ${expected}`)
+      }
+      if (memberName === "mentraos" && target === "app-store-connect" && plan.native.testflight) {
+        validateMentraosTestflightDistribution(plan, plan.native.testflight.group, publication.testflight)
       }
       publications[memberName][target] = publication
     }
@@ -555,9 +595,17 @@ export function finalizeReleaseManifest({plan, results, completedAt}) {
   for (const coordinate of requiredArtifactCoordinates(plan)) {
     if (!artifactCoordinates.has(coordinate)) throw new Error(`Missing required artifact ${coordinate}`)
   }
-  const starterKit = validateStarterKitEvidence(plan, results.starterKit, artifacts)
-  const exampleTestflight = validateProductionExampleTestflight(plan, results.exampleTestflight)
   const cloud = validateCloudV2DeploymentRecord({plan, record: results.cloud})
+  const runtimeImage =
+    plan.channel === "production" ? undefined : validateRuntimeImageRecord({plan, record: results.runtimeImage})
+  const privateDeployment =
+    plan.channel === "dev"
+      ? validatePrivateDeploymentRecord({
+          plan,
+          record: results.privateDeployment,
+          runtimeImage,
+        })
+      : undefined
 
   let promotion
   if (plan.channel === "production") {
@@ -585,15 +633,15 @@ export function finalizeReleaseManifest({plan, results, completedAt}) {
     releaseIdentity: plan.releaseIdentity,
     channel: plan.channel,
     sourceCommit: plan.sourceCommit,
-    native: plan.native,
+    native: androidBuildNumber === plan.native.buildNumber ? plan.native : {...plan.native, androidBuildNumber},
     completedAt,
     releasePlanSha256: releaseRecordSha256(plan),
     publications,
     otaManifest,
     artifacts,
     cloud,
-    ...(starterKit ? {starterKit} : {}),
-    ...(exampleTestflight ? {exampleTestflight} : {}),
+    ...(runtimeImage ? {runtimeImage} : {}),
+    ...(privateDeployment ? {privateDeployment} : {}),
     ...(promotion ? {promotion} : {}),
   }
 }

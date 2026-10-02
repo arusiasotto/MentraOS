@@ -31,7 +31,11 @@ export default function MainSettingsPage() {
 
   return (
     <Screen preset="fixed" safeAreaEdges={["top"]} ref={viewShotRef} className="px-0">
-      <ScrollView className="pt-8 px-6" contentInsetAdjustmentBehavior="automatic">
+      <ScrollView
+        className="pt-8 px-6"
+        contentInsetAdjustmentBehavior="automatic"
+        // Keep the indicator at the viewport edge during the miniapp's animated transitions.
+        automaticallyAdjustsScrollIndicatorInsets={false}>
         <View style={{flex: 1, gap: theme.spacing.s6}}>
           <Group title={translate("account:accountSettings")}>
             <RouteButton
@@ -100,7 +104,7 @@ export default function MainSettingsPage() {
         </View>
 
         <VersionInfo />
-        <Spacer height={theme.spacing.s10} />
+        <Spacer height={theme.spacing.s16} />
       </ScrollView>
     </Screen>
   )

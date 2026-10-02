@@ -6,6 +6,7 @@ import com.mentra.crust.services.NotificationListener
 import com.mentra.crust.services.NotificationProcessBridge
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
+import expo.modules.kotlin.functions.Queues
 import java.net.URL
 
 import com.mentra.crust.navigation.NavigationManager
@@ -48,10 +49,6 @@ class CrustModule : Module() {
       packageName: String,
     ) {
       NotificationProcessBridge.emitDismissed(context, notificationKey, packageName)
-    }
-
-    fun emitCaptionsTesterIncident(data: Map<String, Any>) {
-      emitEvent("captions_tester_incident", data)
     }
 
     private fun emitEvent(eventName: String, data: Map<String, Any>) {
@@ -120,7 +117,6 @@ class CrustModule : Module() {
       "onChange",
       "phone_notification",
       "phone_notification_dismissed",
-      "captions_tester_incident",
       "onNavManeuver",
       "onNavRerouting",
       "onNavArrived",
@@ -160,13 +156,23 @@ class CrustModule : Module() {
     }
 
     AsyncFunction("nativeHttpRequest") {
-      method: String, url: String, headers: Map<String, String>, body: String? ->
-      val result = JSCPolyfillBridge.executeHttp(method, url, headers, body)
-      mapOf(
-        "status" to result.status,
-        "statusText" to result.statusText,
-        "headers" to result.headers,
-        "body" to result.body,
+      method: String, url: String, headers: Map<String, String>, body: String?, promise: expo.modules.kotlin.Promise ->
+      JSCPolyfillBridge.enqueueHttp(
+        method,
+        url,
+        headers,
+        body,
+        onResult = { result ->
+          promise.resolve(
+            mapOf(
+              "status" to result.status,
+              "statusText" to result.statusText,
+              "headers" to result.headers,
+              "body" to result.body,
+            )
+          )
+        },
+        onError = { error -> promise.reject("E_NATIVE_HTTP", error.message ?: "Native HTTP request failed", error) },
       )
     }
 
@@ -922,7 +928,7 @@ class CrustModule : Module() {
         android.util.Log.e("CrustModule", "stopNavigation failed", e)
         mapOf("ok" to false, "error" to (e.message ?: "stop failed"))
       }
-    }
+    }.runOnQueue(Queues.MAIN)
 
     // Dev-only: nudge the simulated position ~offsetMeters off-route to
     // exercise the Nav SDK's onRerouting() pipeline without having to

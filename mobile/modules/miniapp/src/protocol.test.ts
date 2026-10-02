@@ -54,6 +54,21 @@ describe("MiniappRequestType wire values", () => {
   test("COPY_CLIPBOARD", () => expect(MiniappRequestType.COPY_CLIPBOARD).toBe("miniapp_copy_clipboard"))
   test("DOWNLOAD", () => expect(MiniappRequestType.DOWNLOAD).toBe("miniapp_download"))
   test("SCAN_QR", () => expect(MiniappRequestType.SCAN_QR).toBe("miniapp_scan_qr"))
+  test("MEETING_JOIN", () => expect(MiniappRequestType.MEETING_JOIN).toBe("miniapp_meeting_join"))
+  test("MEETING_LEAVE", () => expect(MiniappRequestType.MEETING_LEAVE).toBe("miniapp_meeting_leave"))
+  test("MEETING_SET_MUTED", () => expect(MiniappRequestType.MEETING_SET_MUTED).toBe("miniapp_meeting_set_muted"))
+  test("MEETING_SET_VIDEO_ENABLED", () =>
+    expect(MiniappRequestType.MEETING_SET_VIDEO_ENABLED).toBe("miniapp_meeting_set_video_enabled"))
+  test("MEETING_UPDATE_VIDEO_SOURCE", () =>
+    expect(MiniappRequestType.MEETING_UPDATE_VIDEO_SOURCE).toBe("miniapp_meeting_update_video_source"))
+  test("MEETING_GET_STATE", () => expect(MiniappRequestType.MEETING_GET_STATE).toBe("miniapp_meeting_get_state"))
+  test("MEETING_PAUSE_VIDEO_PUBLISHER", () =>
+    expect(MiniappRequestType.MEETING_PAUSE_VIDEO_PUBLISHER).toBe("miniapp_meeting_pause_video_publisher"))
+  test("MEETING_RESUME_VIDEO_PUBLISHER", () =>
+    expect(MiniappRequestType.MEETING_RESUME_VIDEO_PUBLISHER).toBe("miniapp_meeting_resume_video_publisher"))
+  test("MEETING_SHOW_CARD", () => expect(MiniappRequestType.MEETING_SHOW_CARD).toBe("miniapp_meeting_show_card"))
+  test("MEETING_SHOW_IMAGE", () => expect(MiniappRequestType.MEETING_SHOW_IMAGE).toBe("miniapp_meeting_show_image"))
+  test("MEETING_SHOW_LIVE", () => expect(MiniappRequestType.MEETING_SHOW_LIVE).toBe("miniapp_meeting_show_live"))
 })
 
 describe("MiniappResponseType wire values", () => {
@@ -63,6 +78,10 @@ describe("MiniappResponseType wire values", () => {
   test("CAPABILITIES_UPDATE", () => expect(MiniappResponseType.CAPABILITIES_UPDATE).toBe("miniapp_capabilities_update"))
   test("VISIBILITY_CHANGE", () => expect(MiniappResponseType.VISIBILITY_CHANGE).toBe("miniapp_visibility_change"))
   test("PONG", () => expect(MiniappResponseType.PONG).toBe("miniapp_pong"))
+  test("ACTION_CALL", () => expect(MiniappResponseType.ACTION_CALL).toBe("miniapp_action_call"))
+  test("MEETING_STATE", () => expect(MiniappResponseType.MEETING_STATE).toBe("miniapp_meeting_state"))
+  test("MEETING_VIDEO_PUBLISHER", () =>
+    expect(MiniappResponseType.MEETING_VIDEO_PUBLISHER).toBe("miniapp_meeting_video_publisher"))
   test("ERROR", () => expect(MiniappResponseType.ERROR).toBe("miniapp_error"))
 })
 

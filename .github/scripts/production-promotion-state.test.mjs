@@ -6,9 +6,12 @@ import {
   ATTESTATION_CHECKS,
   PROMOTION_STATES,
   abortPromotionRecord,
+  canResolveDeferredCheck,
   createInitialPromotionRecord,
+  deferredChecks,
   nextAction,
   promotionAssetName,
+  requirePromotionMatchesPackages,
   transitionPromotionRecord,
   transitionWithAttestation,
   validateAttestation,
@@ -33,9 +36,10 @@ function initial() {
       manifestUrl: "https://github.com/Mentra-Community/MentraOS/releases/download/mentra-builds-v3.1.0/beta.json",
       manifestSha256: "b".repeat(64),
     },
-    source: {mentraosCommit: "a".repeat(40), starterKitCommit: "c".repeat(40)},
+    source: {mentraosCommit: "a".repeat(40)},
     coordinates: {
       currentMentraApp: {
+        provenance: "coordinated",
         sourceCommit: "f".repeat(40),
         provenanceUrl: "https://github.com/Mentra-Community/MentraOS/releases/tag/mentra-v3.0.0",
         ios: coordinate(300000100),
@@ -44,7 +48,36 @@ function initial() {
       compatibilityLab: {ios: coordinate(310000090), android: coordinate(310000090)},
       candidates: {
         mentraApp: {ios: coordinate(310000100), android: coordinate(310000101)},
-        starterKit: {ios: coordinate(310000200), android: coordinate(310000201)},
+      },
+    },
+    actor: "release-owner",
+    createdAt: now,
+    provenanceUrl: runUrl,
+  })
+}
+
+function storeObserved() {
+  return createInitialPromotionRecord({
+    releaseIdentity: "3.1.0",
+    attempt: 1,
+    selectedBeta: {
+      identity: "3.1.0-beta.57",
+      releaseSetId: "mentra-3.1.0-beta.57",
+      manifestUrl: "https://github.com/Mentra-Community/MentraOS/releases/download/mentra-builds-v3.1.0/beta.json",
+      manifestSha256: "b".repeat(64),
+    },
+    source: {mentraosCommit: "a".repeat(40)},
+    coordinates: {
+      currentMentraApp: {
+        provenance: "store-observed",
+        sourceCommit: null,
+        provenanceUrl: null,
+        ios: {marketingVersion: "3.0", buildNumber: 51180073},
+        android: {marketingVersion: "3.0", buildNumber: 51180031},
+      },
+      compatibilityLab: null,
+      candidates: {
+        mentraApp: {ios: coordinate(310000100), android: coordinate(310000100)},
       },
     },
     actor: "release-owner",
@@ -225,6 +258,14 @@ test("requires complete platform coverage and rejects credential-like evidence",
   assert.throws(
     () =>
       validateAttestation(
+        {...attestation, tests: [...attestation.tests, {...attestation.tests[0], product: "starter-kit"}]},
+        record,
+      ),
+    /product is unsupported/,
+  )
+  assert.throws(
+    () =>
+      validateAttestation(
         {...attestation, tests: [{...attestation.tests[0], appBuild: "BUILD"}, attestation.tests[1]]},
         record,
       ),
@@ -262,18 +303,12 @@ test("binds every human gate to its check-specific frozen coordinates", () => {
     {
       check: "production-mobile-candidate-acceptance",
       record: atState("mobile-candidates-uploaded"),
-      coordinates: {
-        "mentra-app": initialRecord.coordinates.candidates.mentraApp,
-        "starter-kit": initialRecord.coordinates.candidates.starterKit,
-      },
+      coordinates: {"mentra-app": initialRecord.coordinates.candidates.mentraApp},
     },
     {
       check: "store-review-approved",
       record: atState("stores-submitted"),
-      coordinates: {
-        "mentra-app": initialRecord.coordinates.candidates.mentraApp,
-        "starter-kit": initialRecord.coordinates.candidates.starterKit,
-      },
+      coordinates: {"mentra-app": initialRecord.coordinates.candidates.mentraApp},
     },
   ]
   for (const {check, record, coordinates} of cases) {
@@ -306,6 +341,178 @@ test("binds every human gate to its check-specific frozen coordinates", () => {
     wrong.tests[0].appBuild += 1
     assert.throws(() => validateAttestation(wrong, record), /does not match frozen/)
   }
+})
+
+test("pre-submission human gates can be deferred and must be attested before public release", () => {
+  const initialRecord = initial()
+  const passing = (record, check, coordinates) => ({
+    schemaVersion: 1,
+    promotionId: record.promotionId,
+    releaseIdentity: record.releaseIdentity,
+    check,
+    result: "pass",
+    performedAt: now,
+    tester: {githubLogin: "qa-owner"},
+    tests: ATTESTATION_CHECKS[check].coverage.map((coverage) => {
+      const [product, platform] = coverage.split(":")
+      return {
+        product,
+        platform,
+        result: "pass",
+        appVersion: coordinates[platform].marketingVersion,
+        appBuild: coordinates[platform].buildNumber,
+        deviceModel: "release device",
+        osVersion: "release OS",
+      }
+    }),
+    evidenceUrls: [runUrl],
+  })
+  const deferral = (record, check) => ({
+    schemaVersion: 1,
+    promotionId: record.promotionId,
+    releaseIdentity: record.releaseIdentity,
+    check,
+    result: "deferred",
+    performedAt: now,
+    tester: {githubLogin: "release-owner"},
+    reason: "verify during store review",
+    notes: "deferred",
+  })
+  const attest = (record, attestation) =>
+    transitionWithAttestation({
+      record,
+      attestation,
+      actor: "release-owner",
+      createdAt: now,
+      provenanceUrl: runUrl,
+      evidenceUrl: runUrl,
+      assetName: `${attestation.check}-${attestation.result}.json`,
+      sha256: "e".repeat(64),
+    })
+  const resolvedOneOf = (record) =>
+    attest(record, passing(record, "production-mobile-n-compatibility", initialRecord.coordinates.currentMentraApp))
+  const advance = (record, to) =>
+    transitionPromotionRecord({
+      record,
+      to,
+      actor: "release-owner",
+      createdAt: now,
+      provenanceUrl: runUrl,
+      evidence: evidence(to),
+    })
+
+  // Only the two pre-submission gates, and only in their own state.
+  const cloudDeployed = atState("cloud-deployed")
+  assert.throws(
+    () =>
+      validateAttestation(deferral(atState("stores-submitted"), "store-review-approved"), atState("stores-submitted")),
+    /cannot be deferred/,
+  )
+  assert.throws(
+    () => validateAttestation(deferral(cloudDeployed, "production-mobile-candidate-acceptance"), cloudDeployed),
+    /cannot apply in state cloud-deployed/,
+  )
+  const withTests = {...deferral(cloudDeployed, "production-mobile-n-compatibility"), tests: []}
+  assert.throws(() => validateAttestation(withTests, cloudDeployed), /carries no test results/)
+  for (const reason of [undefined, "", "   ", "reason with key msk_abcdefghijklmnopqrstuvwxyz0123456789"]) {
+    const unreasoned = {...deferral(cloudDeployed, "production-mobile-n-compatibility"), reason}
+    assert.throws(() => validateAttestation(unreasoned, cloudDeployed), /attestation\.reason/)
+  }
+
+  // Deferring moves the promotion on and records the open gate.
+  const deferred = attest(cloudDeployed, deferral(cloudDeployed, "production-mobile-n-compatibility"))
+  assert.equal(deferred.state, "current-clients-accepted")
+  assert.equal(deferred.evidence.at(-1).kind, "production-mobile-n-compatibility-deferred")
+  assert.deepEqual(deferredChecks(deferred), ["production-mobile-n-compatibility"])
+  assert.equal(canResolveDeferredCheck(deferred, "production-mobile-n-compatibility"), true)
+  assert.deepEqual(nextAction(deferred), {kind: "workflow", workflow: "production-release-mobile.yml", phase: "build"})
+
+  // A second deferral at candidate acceptance, then the chain reaches stores-approved.
+  let record = advance(deferred, "mobile-candidates-uploaded")
+  record = attest(record, deferral(record, "production-mobile-candidate-acceptance"))
+  assert.equal(record.state, "mobile-candidates-accepted")
+  record = advance(record, "stores-submitted")
+  record = attest(record, passing(record, "store-review-approved", initialRecord.coordinates.candidates.mentraApp))
+  assert.equal(record.state, "stores-approved")
+  assert.deepEqual(deferredChecks(record), [
+    "production-mobile-n-compatibility",
+    "production-mobile-candidate-acceptance",
+  ])
+
+  // Public release is refused while any deferral is unresolved, including when
+  // the approval's own evidence reference is crafted to look like the resolution.
+  assert.throws(() => advance(record, "public-release-approved"), /deferred human gates to be attested first/)
+  assert.throws(
+    () =>
+      transitionPromotionRecord({
+        record: resolvedOneOf(record),
+        to: "public-release-approved",
+        actor: "release-owner",
+        createdAt: now,
+        provenanceUrl: runUrl,
+        evidence: evidence("production-mobile-candidate-acceptance"),
+      }),
+    /deferred human gates to be attested first: production-mobile-candidate-acceptance/,
+  )
+
+  // Resolving in place: same state, the check's own evidence kind appended.
+  const resolvedOne = attest(
+    record,
+    passing(record, "production-mobile-n-compatibility", initialRecord.coordinates.currentMentraApp),
+  )
+  assert.equal(resolvedOne.state, "stores-approved")
+  assert.equal(resolvedOne.evidence.at(-1).kind, "production-mobile-n-compatibility")
+  assert.deepEqual(deferredChecks(resolvedOne), ["production-mobile-candidate-acceptance"])
+  assert.throws(
+    () =>
+      attest(
+        resolvedOne,
+        passing(resolvedOne, "production-mobile-n-compatibility", initialRecord.coordinates.currentMentraApp),
+      ),
+    /cannot apply in state stores-approved/,
+  )
+  const resolvedBoth = attest(
+    resolvedOne,
+    passing(resolvedOne, "production-mobile-candidate-acceptance", initialRecord.coordinates.candidates.mentraApp),
+  )
+  assert.deepEqual(deferredChecks(resolvedBoth), [])
+  assert.equal(advance(resolvedBoth, "public-release-approved").state, "public-release-approved")
+
+  // A non-deferred check still cannot be attested out of its own state.
+  assert.throws(
+    () =>
+      attest(
+        atState("stores-approved"),
+        passing(
+          atState("stores-approved"),
+          "production-mobile-n-compatibility",
+          initialRecord.coordinates.currentMentraApp,
+        ),
+      ),
+    /cannot apply in state stores-approved/,
+  )
+})
+
+test("rejects Starter Kit fields from the Mentra-App-only production schema", () => {
+  const record = initial()
+  assert.throws(
+    () => validatePromotionRecord({...record, source: {...record.source, starterKitCommit: "c".repeat(40)}}),
+    /source must contain only mentraosCommit/,
+  )
+  assert.throws(
+    () =>
+      validatePromotionRecord({
+        ...record,
+        coordinates: {
+          ...record.coordinates,
+          candidates: {
+            ...record.coordinates.candidates,
+            starterKit: {ios: coordinate(310000200), android: coordinate(310000201)},
+          },
+        },
+      }),
+    /coordinates.candidates must contain only mentraApp/,
+  )
 })
 
 test("aborting is terminal and preserves the previous digest", () => {
@@ -386,4 +593,153 @@ test("allows append-only rollout observations before completion", () => {
   })
   assert.equal(completed.state, "completed")
   assert.equal(completed.previous.assetName, promotionAssetName(finalizing))
+})
+
+test("stable packages only read the promotion to reject a conflicting frozen beta", () => {
+  const link = {betaIdentity: "3.1.0-beta.57", sourceCommit: "a".repeat(40)}
+  for (const state of PROMOTION_STATES) {
+    const record = atState(state)
+    assert.deepEqual(requirePromotionMatchesPackages(record, link), {state, attempt: 1})
+  }
+  const aborted = abortPromotionRecord({
+    record: initial(),
+    actor: "release-owner",
+    createdAt: now,
+    provenanceUrl: runUrl,
+    reason: "withdrawn",
+  })
+  assert.equal(requirePromotionMatchesPackages(aborted, {...link, betaIdentity: "3.1.0-beta.58"}).state, "aborted")
+  assert.throws(
+    () => requirePromotionMatchesPackages(initial(), {...link, betaIdentity: "3.1.0-beta.58"}),
+    /selected 3\.1\.0-beta\.57/,
+  )
+  assert.throws(
+    () => requirePromotionMatchesPackages(initial(), {...link, sourceCommit: "e".repeat(40)}),
+    /froze source/,
+  )
+  assert.throws(
+    () =>
+      transitionPromotionRecord({
+        record: initial(),
+        to: "selected",
+        actor: "release-owner",
+        createdAt: now,
+        provenanceUrl: runUrl,
+        evidence: evidence("production-packages-publication"),
+      }),
+    /not contiguous/,
+  )
+})
+
+test("a store-observed current app skips the compatibility lab and starts at staging-compatible", () => {
+  const record = storeObserved()
+  assert.equal(record.state, "staging-compatible")
+  assert.equal(record.sequence, 0)
+  assert.deepEqual(nextAction(record), {
+    kind: "workflow",
+    workflow: "production-release-cloud.yml",
+    phase: "preflight",
+  })
+  const next = transitionPromotionRecord({
+    record,
+    to: "production-config-ready",
+    actor: "release-owner",
+    createdAt: now,
+    provenanceUrl: runUrl,
+    evidence: evidence("production-config-ready"),
+  })
+  assert.equal(next.state, "production-config-ready")
+  assert.throws(
+    () => validatePromotionRecord({...record, state: "selected"}),
+    /without a compatibility lab cannot be in state selected/,
+  )
+})
+
+test("a store-observed current app cannot carry coordinated provenance or lab coordinates", () => {
+  const record = storeObserved()
+  assert.throws(
+    () =>
+      validatePromotionRecord({
+        ...record,
+        coordinates: {
+          ...record.coordinates,
+          currentMentraApp: {...record.coordinates.currentMentraApp, sourceCommit: "f".repeat(40)},
+        },
+      }),
+    /has no source commit or provenance URL/,
+  )
+  assert.throws(
+    () =>
+      validatePromotionRecord({
+        ...record,
+        coordinates: {...record.coordinates, compatibilityLab: {ios: coordinate(1), android: coordinate(1)}},
+      }),
+    /cannot have compatibility-lab coordinates/,
+  )
+  assert.throws(
+    () =>
+      validatePromotionRecord({
+        ...record,
+        coordinates: {
+          ...record.coordinates,
+          currentMentraApp: {...record.coordinates.currentMentraApp, provenance: "legacy"},
+        },
+      }),
+    /provenance must be coordinated or store-observed/,
+  )
+  const coordinated = initial()
+  assert.throws(
+    () =>
+      validatePromotionRecord({
+        ...coordinated,
+        coordinates: {...coordinated.coordinates, compatibilityLab: null},
+      }),
+    /compatibilityLab\.ios must be an object/,
+  )
+})
+
+test("the store-observed app is still attested against production Cloud N+1 by its store coordinates", () => {
+  let record = storeObserved()
+  for (const state of ["production-config-ready", "cloud-deployed"]) {
+    record = transitionPromotionRecord({
+      record,
+      to: state,
+      actor: "release-owner",
+      createdAt: now,
+      provenanceUrl: runUrl,
+      evidence: evidence(state),
+    })
+  }
+  assert.deepEqual(nextAction(record), {kind: "attest", check: "production-mobile-n-compatibility"})
+  const attestation = {
+    schemaVersion: 1,
+    promotionId: record.promotionId,
+    releaseIdentity: record.releaseIdentity,
+    check: "production-mobile-n-compatibility",
+    result: "pass",
+    performedAt: now,
+    tester: {githubLogin: "tester"},
+    tests: [
+      {
+        product: "mentra-app",
+        platform: "ios",
+        result: "pass",
+        appVersion: "3.0",
+        appBuild: "51180073",
+        deviceModel: "iPhone",
+        osVersion: "26.0",
+      },
+      {
+        product: "mentra-app",
+        platform: "android",
+        result: "pass",
+        appVersion: "3.0",
+        appBuild: "51180031",
+        deviceModel: "Pixel",
+        osVersion: "16",
+      },
+    ],
+    evidenceUrls: [runUrl],
+  }
+  assert.equal(validateAttestation(attestation, record), attestation)
 })

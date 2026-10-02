@@ -8,9 +8,15 @@ import {fileURLToPath} from "node:url"
 import {loadReleaseFamily} from "./release-family.mjs"
 import {
   isHttpsRegistryUrl,
+  isNpmConflictError,
   npmMembersInOrder,
   npmReleaseTag,
+  npmReadbackAttempts,
+  npmStagedVersionConflict,
+  npmReadbackWaitSeconds,
   npmViewPublishedTarball,
+  NPM_READBACK_POLL_SECONDS,
+  publishWithRetry,
   releaseMetadataArgs,
   requireNpmProvenanceSource,
   requirePlanSourceCommit,
@@ -52,7 +58,19 @@ test("selects the complete npm family in dependency order", () => {
   const selected = npmMembersInOrder(family, ["all"])
   assert.equal(selected.length, family.members.filter((member) => member.publishTargets.includes("npm")).length)
   assert.equal(selected.includes("@mentra/types"), false)
+  assert.ok(selected.includes("@mentra/glasses-media"))
+  assert.ok(selected.indexOf("@mentra/glasses-media") < selected.indexOf("@mentra/acs-meeting"))
   assert.equal(selected.at(-1), "@mentra/engine")
+})
+
+test("all npm release members have public publication and valid provenance metadata", () => {
+  const family = loadReleaseFamily({rootDir: repositoryRoot})
+  for (const member of family.members.filter((member) => member.publishTargets.includes("npm"))) {
+    const manifest = JSON.parse(readFileSync(path.join(repositoryRoot, member.manifest), "utf8"))
+    assert.notEqual(manifest.private, true, member.name)
+    assert.equal(manifest.publishConfig?.access, "public", member.name)
+    requireNpmProvenanceSource(manifest, member.manifest)
+  }
 })
 
 test("admits Engine only as the final selected npm package", () => {
@@ -86,6 +104,56 @@ test("waits through empty npm metadata until the registry exposes the tarball", 
     "https://registry.npmjs.org/package/-/package-3.1.0.tgz",
   )
   assert.equal(sleeps, 2)
+})
+
+test("waits at least 30 minutes for npm to finish processing a publish", () => {
+  assert.equal(npmReadbackWaitSeconds(), 30 * 60)
+  assert.equal(npmReadbackWaitSeconds(1024), 30 * 60)
+  assert.equal(npmReadbackAttempts(), (30 * 60) / NPM_READBACK_POLL_SECONDS + 1)
+
+  let sleeps = 0
+  const progress = []
+  assert.equal(
+    npmViewPublishedTarball("package@3.1.0", {
+      view: () => "",
+      sleep: () => {
+        sleeps += 1
+      },
+      log: (line) => progress.push(line),
+    }),
+    null,
+  )
+  assert.equal(sleeps * NPM_READBACK_POLL_SECONDS, 30 * 60)
+  assert.equal(progress.length, 6)
+  assert.match(progress[0], /^npm has not exposed package@3\.1\.0 yet; waited 300s of up to 1800s$/)
+  assert.match(progress.at(-1), /waited 1800s of up to 1800s$/)
+})
+
+test("waits longer for larger tarballs before giving up on the read-back", () => {
+  const bluetoothSdkBytes = Math.round(18.5 * 1024 * 1024)
+  assert.equal(npmReadbackWaitSeconds(bluetoothSdkBytes), 19 * 2 * 60)
+  assert.ok(npmReadbackWaitSeconds(bluetoothSdkBytes) > npmReadbackWaitSeconds())
+  assert.ok(npmReadbackWaitSeconds(60 * 1024 * 1024) > npmReadbackWaitSeconds(bluetoothSdkBytes))
+
+  let sleeps = 0
+  let views = 0
+  assert.equal(
+    npmViewPublishedTarball("@mentra/bluetooth-sdk@3.1.0-beta.192", {
+      tarballBytes: bluetoothSdkBytes,
+      view: () => {
+        views += 1
+        return null
+      },
+      sleep: () => {
+        sleeps += 1
+      },
+      log: () => {},
+    }),
+    null,
+  )
+  assert.equal(views, sleeps + 1)
+  assert.equal(sleeps * NPM_READBACK_POLL_SECONDS, npmReadbackWaitSeconds(bluetoothSdkBytes))
+  assert.ok(sleeps * NPM_READBACK_POLL_SECONDS > 30 * 60)
 })
 
 test("requires the package checkout to match the immutable release plan", () => {
@@ -137,4 +205,209 @@ test("stamps SDK and Engine packages from the same immutable release metadata", 
       "b".repeat(64),
     ],
   )
+})
+
+test("retries a publish that fails before Sigstore issues a certificate", () => {
+  let calls = 0
+  const status = publishWithRetry("@mentra/engine@3.2.0-dev.157", "sha512-abc", {
+    publish: () => {
+      calls += 1
+      if (calls < 3) throw new Error("CA_CREATE_SIGNING_CERTIFICATE_ERROR: read ECONNRESET")
+    },
+    registryIntegrityOf: () => null,
+    sleep: () => {},
+  })
+  assert.equal(status, "published")
+  assert.equal(calls, 3)
+})
+
+test("accepts a publish that landed even though the command reported failure", () => {
+  let calls = 0
+  const status = publishWithRetry("@mentra/engine@3.2.0-dev.157", "sha512-abc", {
+    publish: () => {
+      calls += 1
+      throw new Error("write ECONNRESET")
+    },
+    registryIntegrityOf: () => "sha512-abc",
+    sleep: () => {},
+  })
+  assert.equal(status, "published")
+  assert.equal(calls, 1)
+})
+
+test("refuses a registry copy whose bytes differ from the packed tarball", () => {
+  assert.throws(
+    () =>
+      publishWithRetry("@mentra/engine@3.2.0-dev.157", "sha512-abc", {
+        publish: () => {
+          throw new Error("boom")
+        },
+        registryIntegrityOf: () => "sha512-different",
+        sleep: () => {},
+      }),
+    /already exists on npm with different bytes/,
+  )
+})
+
+test("gives up after the last attempt and surfaces the publish error", () => {
+  let calls = 0
+  assert.throws(
+    () =>
+      publishWithRetry("@mentra/engine@3.2.0-dev.157", "sha512-abc", {
+        attempts: 3,
+        publish: () => {
+          calls += 1
+          throw new Error("read ECONNRESET")
+        },
+        registryIntegrityOf: () => null,
+        sleep: () => {},
+      }),
+    /read ECONNRESET/,
+  )
+  assert.equal(calls, 3)
+})
+
+test("retries when the recovery registry read also fails", () => {
+  let publishes = 0
+  let reads = 0
+  let pauses = 0
+  const status = publishWithRetry("@mentra/engine@3.2.0-dev.157", "sha512-abc", {
+    publish: () => {
+      publishes += 1
+      throw new Error("publish connection reset")
+    },
+    registryIntegrityOf: () => {
+      reads += 1
+      if (reads === 1) throw new Error("registry unavailable")
+      return "sha512-abc"
+    },
+    sleep: () => {
+      pauses += 1
+    },
+  })
+  assert.equal(status, "published")
+  assert.equal(publishes, 2)
+  assert.equal(reads, 2)
+  assert.equal(pauses, 1)
+})
+
+test("keeps bounded attempts and the publish error when every recovery read fails", () => {
+  let publishes = 0
+  let pauses = 0
+  const publishError = new Error("publish connection reset")
+  assert.throws(
+    () =>
+      publishWithRetry("@mentra/engine@3.2.0-dev.157", "sha512-abc", {
+        attempts: 3,
+        publish: () => {
+          publishes += 1
+          throw publishError
+        },
+        registryIntegrityOf: () => {
+          throw new Error("registry unavailable")
+        },
+        sleep: () => {
+          pauses += 1
+        },
+      }),
+    (error) => error === publishError,
+  )
+  assert.equal(publishes, 3)
+  assert.equal(pauses, 2)
+})
+
+// The stderr npm printed in run 34833322934 (2026-09-14) when the re-run of a
+// publish npm was still processing reached the registry.
+function stagedVersionConflictText(name, version) {
+  return [
+    `npm error code E409`,
+    `npm error 409 Conflict - PUT https://registry.npmjs.org/${encodeURIComponent(name)} - Cannot publish over previously staged version "${version}".`,
+    `npm error A complete log of this run can be found in: /home/runner/.npm/_logs/2026-09-14T10_30_26_355Z-debug-0.log`,
+    "",
+  ].join("\n")
+}
+
+function failedNpmPublish(name, version, stderr) {
+  return new Error(
+    `npm publish release-output/${name.replace(/^@/, "").replaceAll("/", "-")}-${version}.tgz --tag candidate-${version} --access public --provenance failed with exit code 1\n${stderr}`,
+  )
+}
+
+test("recognises npm's staged-version publish conflict", () => {
+  const text = stagedVersionConflictText("@mentra/bluetooth-sdk", "3.1.1")
+  assert.equal(isNpmConflictError(text), true)
+  assert.equal(npmStagedVersionConflict(text), "3.1.1")
+  assert.equal(
+    npmStagedVersionConflict("npm error code E409\nnpm error 409 Conflict - cannot modify pre-existing version: 3.1.1"),
+    null,
+  )
+  assert.equal(isNpmConflictError("CA_CREATE_SIGNING_CERTIFICATE_ERROR: read ECONNRESET"), false)
+  assert.equal(npmStagedVersionConflict('Cannot publish over previously staged version "3.1.1"'), null)
+})
+
+test("treats a conflict with its own staged version as published and awaits the read-back", () => {
+  const name = "@mentra/bluetooth-sdk"
+  const version = "3.1.1"
+  let publishes = 0
+  let sleeps = 0
+  const log = []
+  const status = publishWithRetry(`${name}@${version}`, "sha512-abc", {
+    publish: () => {
+      publishes += 1
+      throw failedNpmPublish(name, version, stagedVersionConflictText(name, version))
+    },
+    registryIntegrityOf: () => null,
+    sleep: () => {
+      sleeps += 1
+    },
+    log: (line) => log.push(line),
+  })
+  assert.equal(status, "published")
+  assert.equal(publishes, 1)
+  assert.equal(sleeps, 0)
+  assert.match(log.at(-1), /already holds @mentra\/bluetooth-sdk@3\.1\.1 as a staged publish/)
+})
+
+test("fails closed on a staged-version conflict for a different version", () => {
+  let publishes = 0
+  assert.throws(
+    () =>
+      publishWithRetry("@mentra/bluetooth-sdk@3.1.1", "sha512-abc", {
+        publish: () => {
+          publishes += 1
+          throw failedNpmPublish(
+            "@mentra/bluetooth-sdk",
+            "3.1.1",
+            stagedVersionConflictText("@mentra/bluetooth-sdk", "3.1.0"),
+          )
+        },
+        registryIntegrityOf: () => null,
+        sleep: () => assert.fail("a conflict must not be retried"),
+        log: () => {},
+      }),
+    /conflict that is not its own staged version[\s\S]*previously staged version "3\.1\.0"/,
+  )
+  assert.equal(publishes, 1)
+})
+
+test("fails closed without retrying on any other npm conflict", () => {
+  let publishes = 0
+  assert.throws(
+    () =>
+      publishWithRetry("@mentra/engine@3.1.1", "sha512-abc", {
+        publish: () => {
+          publishes += 1
+          throw failedNpmPublish(
+            "@mentra/engine",
+            "3.1.1",
+            "npm error code E409\nnpm error 409 Conflict - PUT https://registry.npmjs.org/@mentra%2fengine - cannot modify pre-existing version: 3.1.1\n",
+          )
+        },
+        registryIntegrityOf: () => null,
+        sleep: () => assert.fail("a conflict must not be retried"),
+        log: () => {},
+      }),
+    /conflict that is not its own staged version[\s\S]*cannot modify pre-existing version/,
+  )
+  assert.equal(publishes, 1)
 })

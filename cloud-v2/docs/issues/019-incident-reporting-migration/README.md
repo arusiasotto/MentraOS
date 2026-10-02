@@ -51,6 +51,70 @@ There is deliberately no `/api/incidents` compatibility mount in Cloud V2.
 Glasses logs are report artifacts and use the same artifact endpoint as phone
 logs and screenshots.
 
+The report owner can also attach MP4 recordings to an existing report, whatever
+its status, with multipart `type=video`, a declared capture `source` label (for
+example `phone` or `host`) and `video/mp4` files. Cloud Client exposes this as
+`core.reports.addVideos(reportId, source, videos)`. The source is stored as
+declared; the server cannot verify where a recording was captured. Each video
+may be up to 20 MiB and must start with an ISO `ftyp` box. That header check is
+structural only and does not prove the stream is H264 or decodable. Uploads
+without `type`, or with `type=screenshot`, keep the screenshot contract (phone
+source, 10 MiB); a `video/*` file there is rejected rather than stored as a
+screenshot. Unknown types, non-MP4 videos and a missing source are rejected.
+The 5-file and 51 MiB request limits are unchanged. One invalid file rejects the
+whole upload before anything is stored.
+
+The admin artifact route (GET and HEAD) serves the MP4 inline with its exact
+`Content-Length`. It honors a single byte `Range` with `206` and
+`Content-Range`, returns `416` for multiple or unsatisfiable ranges, and applies
+`If-Range` against the artifact's SHA-256 `ETag`, like the test-run media route.
+The bounded payload is read into memory as before. The admin console plays it in
+a native `<video>` at the same authenticated URL, next to the usual download
+link, and the admin proxy keeps exact lengths on these ranged responses.
+Browser playback and seeking still need qualification. `scripts/fetch-incident-logs.sh` saves these
+artifacts with an `.mp4` extension.
+
+## Slack routing
+
+The admin list API keeps `kind=bug|feedback|automatic` as a stored-kind filter,
+including internal and harness submissions. The dashboard uses the separate
+`category=bug|feedback|internal|testing|automatic` filter to partition triage views.
+When both are provided, both must match. Console MCP `report_list` accepts both
+filters, and `fetch-incident-logs.sh --list` exposes `--kind` and `--category`.
+
+Notifications use the same category precedence as the admin dashboard:
+
+| Category | Rule | Channel | Bot destination env var |
+| --- | --- | --- | --- |
+| Testing | Exact `trigger.source = mentra_automated_testing`, regardless of kind or admin status | `#user-feedback-testing` | `CLOUD_REPORTS_SLACK_CHANNEL_ID_TESTING` |
+| Automatic | Remaining `kind = automatic` reports, including admins' automatic reports | `#user-feedback-auto` | `CLOUD_REPORTS_SLACK_CHANNEL_ID_AUTOMATIC` |
+| Internal | Remaining bugs/feedback from an account on the current admin allowlist | `#user-feedback-internal` | `CLOUD_REPORTS_SLACK_CHANNEL_ID_INTERNAL` |
+| Bug / Feedback | All remaining reports | `#user-feedback` | `CLOUD_REPORTS_SLACK_CHANNEL_ID` |
+
+Internal uses the first-party account email resolved by the server and the existing
+`CLOUD_CORE_ADMIN_EMAILS` / `CLOUD_CORE_ADMIN_EMAIL_DOMAINS` policy. An allowlisted
+base email also grants admin status to its `+tag` aliases on the same domain;
+this applies to any email provider. Domain allowlist entries still match only
+the exact domain. Contact email and
+client context never grant Internal status. If the account lookup fails or times
+out, the existing best-effort notifier posts with the opaque user ID and falls
+back to the non-admin category. Slack routing is evaluated at notification time;
+historical messages are not moved when the allowlist changes.
+
+The existing bot uses `CLOUD_REPORTS_SLACK_BOT_TOKEN` and must be a member of all
+four channels. Each category requires its exact channel ID. Missing credentials
+or channel configuration returns a failure and logs the missing key names;
+Slack refusals and network errors are logged without retrying another channel.
+Report submission remains independent of Slack delivery. There are no webhook
+or cross-channel fallbacks. Bot posts preserve the existing ability to update an
+incident message with agent progress.
+
+Configure all four channel IDs in Doppler `cloud-v2/dev_aws` first, then deploy
+and verify dev before promoting configuration to staging and prod. Existing
+webhook settings are ignored by this notifier and can be retired after rollout.
+Feedback notifies on submission; bug/automatic reports notify once when artifact
+collection completes.
+
 ## Mobile Flow
 
 Manual bug report:
@@ -110,12 +174,13 @@ Gallery media integrity:
   (`MediaMetadataRetriever`/`AVAsset` style) is a separate follow-up if we want
   to prove device-playability before the user opens a video.
 
-Captions tester laptop report:
+External incident requests, including the captions tester:
 
-- Trigger: Android internal Crust event `captions_tester_incident`.
-- Submission:
-  `mobile/modules/engine/src/services/CaptionsTesterReportService.ts`.
-- The service emits the existing `CAPTIONS_TESTER_INCIDENT_RESULT` logcat marker.
+- Trigger: `com.mentra://test/submit-incident-report` on Android and iOS,
+  requiring the existing Super Mode setting and a signed-in app.
+- Submission uses the engine's normal automatic report uploader. The modal
+  exposes correlated request/result JSON and Android logs `INCIDENT_REPORT_RESULT`.
+  See the [shared contract](../../../../mobile/INCIDENT_REPORT_AUTOMATION.md).
 - Cloud V2 transcript test logging is emitted from island via
   `mobile/modules/engine/src/services/CloudTranscriptE2EMetrics.ts`, and the
   laptop monitor records the marker in
@@ -165,7 +230,7 @@ Island/engine:
 - `mobile/modules/engine/src/services/MentraJSCrashloopReportService.ts`
 - `mobile/modules/engine/src/facades/pairing.ts`
 - `mobile/modules/engine/src/services/asg/GalleryMediaIntegrityReportService.ts`
-- `mobile/modules/engine/src/services/CaptionsTesterReportService.ts`
+- `mobile/modules/engine/src/services/SubmitIncidentReportService.ts`
 - `mobile/modules/engine/src/services/CloudTranscriptE2EMetrics.ts`
 
 Host UI:

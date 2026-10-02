@@ -23,7 +23,12 @@ concurrency:
 
 jobs:
   test:
-    runs-on: self-hosted
+    # Blacksmith Linux, not the shared self-hosted Macs. Everything here is
+    # TypeScript, Jest and bun tests (no Maestro, simulators or Xcode). On
+    # the Mac this job competed with the iOS compile check for CPU and uplink
+    # and spent 75–300 s per run uploading a 1.8 GB Bun cache into the repo's
+    # 10 GB Actions cache quota.
+    runs-on: blacksmith-4vcpu-ubuntu-2404
 
     steps:
       - name: Checkout code
@@ -62,5 +67,38 @@ jobs:
       - name: Run Jest tests
         working-directory: ./mobile
         run: bun run test
+        env:
+          CI: true
+
+      # jest.config.js ignores modules/engine and modules/miniapp because those
+      # suites are bun:test, which Jest cannot resolve. They ran nowhere in CI
+      # until now, so they get their own steps.
+      - name: Run engine module tests (bun)
+        working-directory: ./mobile/modules/engine
+        run: bun run test
+        env:
+          CI: true
+
+      - name: Run miniapp SDK tests (bun)
+        working-directory: ./mobile/modules/miniapp
+        run: bun test
+        env:
+          CI: true
+
+      # Also ignored by jest.config.js: the host-side StreamPreview coordinator is bun:test.
+      - name: Run StreamPreview coordinator tests (bun)
+        working-directory: ./mobile
+        run: bun test ./src/services/streamPreview
+        env:
+          CI: true
+
+      # Kotlin, Swift and TypeScript all assert these files, so a stale checked-in
+      # fixture would pass every suite while hiding generator drift.
+      - name: Check frame-preview golden fixtures
+        run: node mobile/modules/frame-preview/fixtures/generate.mjs --check
+
+      - name: Run frame-preview gate tool tests (bun)
+        if: hashFiles('mobile/modules/frame-preview/tools/**/*.test.ts') != ''
+        run: bun test mobile/modules/frame-preview/tools
         env:
           CI: true

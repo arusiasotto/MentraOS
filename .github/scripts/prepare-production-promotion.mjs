@@ -5,7 +5,18 @@ import path from "node:path"
 import {fileURLToPath} from "node:url"
 
 import {createInitialPromotionRecord, promotionAssetName} from "./production-promotion-state.mjs"
-import {createReleasePlan, loadReleaseFamily, releaseRecordSha256, serializeReleaseRecord} from "./release-family.mjs"
+import {
+  buildNumberBelongsTo,
+  createReleasePlan,
+  loadReleaseFamily,
+  releaseRecordSha256,
+  serializeReleaseRecord,
+} from "./release-family.mjs"
+import {
+  allocateFamilyBuildNumber,
+  familyBuildNumberMarker,
+  readMarkersDirectory,
+} from "./allocate-family-build-sequence.mjs"
 
 const COMMIT_PATTERN = /^[0-9a-f]{40}$/
 
@@ -30,6 +41,20 @@ function validateInventory(inventory, {bundleId, allowNoCurrent}) {
 }
 
 function validateCurrentMentraApp(previousManifest, inventory) {
+  if (previousManifest === null) {
+    // First coordinated promotion: no mentra-vX.Y.Z release describes the public
+    // app, so freeze exactly what both stores serve today. The app cannot be
+    // rebuilt for the compatibility lab, but Phase 5 still verifies it against
+    // production Cloud N+1 using these coordinates.
+    const {marketingVersion, buildNumber} = inventory.apple.current
+    return {
+      provenance: "store-observed",
+      sourceCommit: null,
+      provenanceUrl: null,
+      ios: {marketingVersion, buildNumber},
+      android: {marketingVersion, buildNumber: inventory.google.currentVersionCode},
+    }
+  }
   const expected = previousManifest.native
   if (
     !expected ||
@@ -42,7 +67,22 @@ function validateCurrentMentraApp(previousManifest, inventory) {
   if (!COMMIT_PATTERN.test(previousManifest.sourceCommit || "")) {
     throw new Error("Previous production manifest has no full source commit")
   }
+  // A coordinated release that predates the family build-number formula (a
+  // flat or timestamp number outside its family's window) cannot be rebuilt
+  // for the compatibility lab: no number in that family's window would install
+  // over it. It is frozen the way a store-observed app is, and Phase 5 still
+  // verifies it against production Cloud N+1.
+  if (!buildNumberBelongsTo(expected.marketingVersion, expected.buildNumber)) {
+    return {
+      provenance: "store-observed",
+      sourceCommit: null,
+      provenanceUrl: null,
+      ios: {marketingVersion: expected.marketingVersion, buildNumber: expected.buildNumber},
+      android: {marketingVersion: expected.marketingVersion, buildNumber: expected.buildNumber},
+    }
+  }
   return {
+    provenance: "coordinated",
     sourceCommit: previousManifest.sourceCommit,
     provenanceUrl: previousManifest.url,
     ios: {marketingVersion: expected.marketingVersion, buildNumber: expected.buildNumber},
@@ -50,21 +90,10 @@ function validateCurrentMentraApp(previousManifest, inventory) {
   }
 }
 
-export function prepareProductionPromotion({
-  family,
-  betaPlan,
-  betaManifest,
-  betaManifestUrl,
-  betaManifestSha256,
-  previousManifest,
-  mentraInventory,
-  starterKitInventory,
-  starterKitCommit,
-  attempt,
-  actor,
-  createdAt,
-  provenanceUrl,
-}) {
+// Shared by promotion preparation and stable package publication: the selected
+// beta must be complete, internally consistent, pinned to an immutable OTA
+// manifest, and belong to the checked-out release family.
+export function validateSelectedBeta({family, betaPlan, betaManifest}) {
   if (
     betaPlan.channel !== "beta" ||
     betaManifest.channel !== "beta" ||
@@ -85,25 +114,81 @@ export function prepareProductionPromotion({
   ) {
     throw new Error("Selected beta has no immutable OTA manifest pin")
   }
-  const betaStarterKitCommit = betaManifest.starterKit?.starterKit?.releaseCommit
-  if (!COMMIT_PATTERN.test(betaStarterKitCommit || "")) {
-    throw new Error("Selected beta has no exact Starter Kit release commit")
-  }
-  if (!COMMIT_PATTERN.test(starterKitCommit || "")) {
-    throw new Error("Stable Starter Kit tag has no exact release commit")
-  }
+  return betaPlan
+}
+
+export function prepareProductionPromotion({
+  family,
+  betaPlan,
+  betaManifest,
+  betaManifestUrl,
+  betaManifestSha256,
+  previousManifest,
+  mentraInventory,
+  familyAssets,
+  familyMarkers = [],
+  currentFamilyAssets = null,
+  currentFamilyMarkers = [],
+  attempt,
+  actor,
+  createdAt,
+  provenanceUrl,
+}) {
+  validateSelectedBeta({family, betaPlan, betaManifest})
   validateInventory(mentraInventory, {bundleId: "com.mentra.mentra", allowNoCurrent: false})
-  validateInventory(starterKitInventory, {bundleId: "com.mentra.bluetoothsdkexample", allowNoCurrent: true})
   const currentMentraApp = validateCurrentMentraApp(previousManifest, mentraInventory)
-  const lastMentraBuildNumber = Math.max(
-    mentraInventory.apple.maxBuildNumber,
-    mentraInventory.google.maxVersionCode,
-    betaPlan.native.buildNumber,
-  )
-  const compatibilityLabBuildNumber = lastMentraBuildNumber + 1
-  const mentraBuildNumber = lastMentraBuildNumber + 2
-  const starterKitBuildNumber =
-    Math.max(starterKitInventory.apple.maxBuildNumber, starterKitInventory.google.maxVersionCode, mentraBuildNumber) + 1
+  if (!buildNumberBelongsTo(family.familyBaseVersion, betaPlan.native.buildNumber)) {
+    throw new Error(
+      `Selected beta build number ${betaPlan.native.buildNumber} is outside the ${family.familyBaseVersion} family window`,
+    )
+  }
+  // The candidate takes the next family sequence, exactly like a coordinated
+  // run: the next free number above everything the family's build container
+  // already records (earlier runs' markers and ASG client pairs).
+  const promotionId = `mentra-${family.familyBaseVersion}-attempt-${attempt}`
+  const candidate = allocateFamilyBuildNumber({
+    assets: familyAssets,
+    baseVersion: family.familyBaseVersion,
+    owner: `promotion:${promotionId}:candidate`,
+    markers: familyMarkers,
+  })
+  const mentraBuildNumber = candidate.buildNumber
+  if (mentraBuildNumber <= betaPlan.native.buildNumber) {
+    throw new Error(
+      `Family container for ${family.familyBaseVersion} does not record the selected beta build ${betaPlan.native.buildNumber}`,
+    )
+  }
+  // The compatibility lab rebuilds the current public app, so its number is
+  // the next sequence of that app's own family, from that family's container.
+  const hasCompatibilityLab = currentMentraApp.provenance === "coordinated"
+  let compatibilityLab = null
+  if (hasCompatibilityLab) {
+    if (!Array.isArray(currentFamilyAssets)) {
+      throw new Error(`The build container of the current family ${currentMentraApp.ios.marketingVersion} is required`)
+    }
+    compatibilityLab = allocateFamilyBuildNumber({
+      assets: currentFamilyAssets,
+      baseVersion: currentMentraApp.ios.marketingVersion,
+      owner: `promotion:${promotionId}:compatibility-lab`,
+      markers: currentFamilyMarkers,
+    })
+    if (
+      compatibilityLab.buildNumber <= Math.max(currentMentraApp.ios.buildNumber, currentMentraApp.android.buildNumber)
+    ) {
+      throw new Error(
+        `Family container for ${currentMentraApp.ios.marketingVersion} does not record the current public build`,
+      )
+    }
+  }
+  const compatibilityLabBuildNumber = compatibilityLab?.buildNumber ?? null
+  // Google Play only publishes a production release above the one it serves.
+  // A production code above the family's window (a legacy flat number) can
+  // only be exceeded by a family whose window lies above it.
+  if (mentraBuildNumber <= mentraInventory.google.currentVersionCode) {
+    throw new Error(
+      `Candidate build number ${mentraBuildNumber} is not above the Google Play production version code ${mentraInventory.google.currentVersionCode}; release under a family base version whose window lies above that code`,
+    )
+  }
   const productionPlan = createReleasePlan({
     family,
     channel: "production",
@@ -126,24 +211,22 @@ export function prepareProductionPromotion({
       manifestUrl: betaManifestUrl,
       manifestSha256: betaManifestSha256,
     },
-    source: {mentraosCommit: betaPlan.sourceCommit, starterKitCommit},
+    source: {mentraosCommit: betaPlan.sourceCommit},
     coordinates: {
       currentMentraApp,
-      compatibilityLab: {
-        ios: {marketingVersion: currentMentraApp.ios.marketingVersion, buildNumber: compatibilityLabBuildNumber},
-        android: {
-          marketingVersion: currentMentraApp.android.marketingVersion,
-          buildNumber: compatibilityLabBuildNumber,
-        },
-      },
+      compatibilityLab: hasCompatibilityLab
+        ? {
+            ios: {marketingVersion: currentMentraApp.ios.marketingVersion, buildNumber: compatibilityLabBuildNumber},
+            android: {
+              marketingVersion: currentMentraApp.android.marketingVersion,
+              buildNumber: compatibilityLabBuildNumber,
+            },
+          }
+        : null,
       candidates: {
         mentraApp: {
           ios: {marketingVersion: productionPlan.native.marketingVersion, buildNumber: mentraBuildNumber},
           android: {marketingVersion: productionPlan.native.marketingVersion, buildNumber: mentraBuildNumber},
-        },
-        starterKit: {
-          ios: {marketingVersion: productionPlan.native.marketingVersion, buildNumber: starterKitBuildNumber},
-          android: {marketingVersion: productionPlan.native.marketingVersion, buildNumber: starterKitBuildNumber},
         },
       },
     },
@@ -159,7 +242,29 @@ export function prepareProductionPromotion({
       },
     ],
   })
-  return {productionPlan, record}
+  const markers = [
+    {
+      containerBaseVersion: family.familyBaseVersion,
+      marker: familyBuildNumberMarker({
+        baseVersion: family.familyBaseVersion,
+        buildNumber: mentraBuildNumber,
+        owner: candidate.owner,
+      }),
+    },
+    ...(compatibilityLab
+      ? [
+          {
+            containerBaseVersion: currentMentraApp.ios.marketingVersion,
+            marker: familyBuildNumberMarker({
+              baseVersion: currentMentraApp.ios.marketingVersion,
+              buildNumber: compatibilityLab.buildNumber,
+              owner: compatibilityLab.owner,
+            }),
+          },
+        ]
+      : []),
+  ]
+  return {productionPlan, record, markers}
 }
 
 function parseArgs(args) {
@@ -180,8 +285,11 @@ function readJson(file) {
 function main() {
   const args = parseArgs(process.argv.slice(2))
   const betaManifestPath = path.resolve(args["beta-manifest"])
-  const previousManifest = readJson(args["previous-manifest"])
-  previousManifest.url = args["previous-manifest-url"]
+  let previousManifest = null
+  if (args["previous-manifest"] || args["previous-manifest-url"]) {
+    previousManifest = readJson(args["previous-manifest"])
+    previousManifest.url = args["previous-manifest-url"]
+  }
   const result = prepareProductionPromotion({
     family: loadReleaseFamily({rootDir: path.resolve(args.root || process.cwd()), requireVersionMirrors: true}),
     betaPlan: readJson(args["beta-plan"]),
@@ -190,8 +298,10 @@ function main() {
     betaManifestSha256: sha256File(betaManifestPath),
     previousManifest,
     mentraInventory: readJson(args["mentra-inventory"]),
-    starterKitInventory: readJson(args["starter-kit-inventory"]),
-    starterKitCommit: args["starter-kit-commit"],
+    familyAssets: readJson(args["family-assets"]),
+    familyMarkers: readMarkersDirectory(args["family-markers-dir"]),
+    currentFamilyAssets: args["current-family-assets"] ? readJson(args["current-family-assets"]) : null,
+    currentFamilyMarkers: readMarkersDirectory(args["current-family-markers-dir"]),
     attempt: Number(args.attempt),
     actor: args.actor,
     createdAt: args["created-at"],
@@ -202,6 +312,17 @@ function main() {
   const recordFile = path.join(recordDirectory, promotionAssetName(result.record))
   mkdirSync(recordDirectory, {recursive: true})
   writeFileSync(recordFile, serializeReleaseRecord(result.record))
+  if (args["marker-directory"]) {
+    const markerDirectory = path.resolve(args["marker-directory"])
+    for (const {containerBaseVersion, marker} of result.markers) {
+      const directory = path.join(markerDirectory, containerBaseVersion)
+      mkdirSync(directory, {recursive: true})
+      writeFileSync(
+        path.join(directory, `mentra-build-number-${marker.buildNumber}.json`),
+        `${JSON.stringify(marker, null, 2)}\n`,
+      )
+    }
+  }
   console.log(recordFile)
 }
 

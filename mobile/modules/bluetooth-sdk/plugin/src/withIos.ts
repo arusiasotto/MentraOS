@@ -5,13 +5,17 @@ import path from "path"
 import {IOSConfig, type ConfigPlugin, withDangerousMod, withInfoPlist, withPodfile} from "expo/config-plugins"
 
 import {type BluetoothSdkPluginProps} from "./index"
+import {resolveAnalyticsProps} from "./analyticsProps"
 
 const BLUETOOTH_SDK_EXPO_ADAPTER_ENV = "MENTRA_BLUETOOTH_SDK_INCLUDE_EXPO_ADAPTER"
 const BLUETOOTH_SDK_EXPO_ADAPTER_LINE = `ENV['${BLUETOOTH_SDK_EXPO_ADAPTER_ENV}'] ||= '1'`
 const INFO_ANALYTICS_DISABLED = "MentraBluetoothSdkAnalyticsDisabled"
+export const INFO_ANALYTICS_ENVIRONMENT = "MentraBluetoothSdkAnalyticsEnvironment"
 export const INFO_SDK_VERSION = "MentraBluetoothSdkVersion"
 const STALE_INFO_POSTHOG_API_KEY = "MentraBluetoothSdkPostHogApiKey"
 const STALE_INFO_POSTHOG_HOST = "MentraBluetoothSdkPostHogHost"
+/** Lets iOS complete the SDK's pending reconnect, and deliver BLE events, while the app is suspended. */
+export const IOS_BLUETOOTH_BACKGROUND_MODE = "bluetooth-central"
 
 const ensureBluetoothSdkExpoAdapterPodEnv = (podfile: string): string => {
   if (podfile.includes(BLUETOOTH_SDK_EXPO_ADAPTER_ENV)) {
@@ -60,22 +64,6 @@ const withXcodeEnvLocal: ConfigPlugin = (config) => {
   ])
 }
 
-function resolveAnalyticsProps(props: BluetoothSdkPluginProps | undefined) {
-  const analytics = props?.analytics
-  let disabled: boolean | undefined
-  if (analytics === false) {
-    disabled = true
-  } else if (analytics === true) {
-    disabled = false
-  } else if (typeof analytics === "object" && analytics.enabled !== undefined) {
-    disabled = !analytics.enabled
-  }
-
-  return {
-    disabled,
-  }
-}
-
 export function applyBluetoothSdkInfoPlist(
   infoPlist: IOSConfig.InfoPlist,
   props: BluetoothSdkPluginProps | undefined,
@@ -89,12 +77,26 @@ export function applyBluetoothSdkInfoPlist(
   const analytics = resolveAnalyticsProps(props)
 
   delete infoPlist[INFO_ANALYTICS_DISABLED]
+  delete infoPlist[INFO_ANALYTICS_ENVIRONMENT]
   delete infoPlist[STALE_INFO_POSTHOG_API_KEY]
   delete infoPlist[STALE_INFO_POSTHOG_HOST]
 
   infoPlist[INFO_SDK_VERSION] = sdkVersion
+
+  // Merge, never replace: apps may also declare audio, location or other modes.
+  const declaredModes = infoPlist.UIBackgroundModes
+  if (declaredModes !== undefined && !Array.isArray(declaredModes)) {
+    throw new Error("ios.infoPlist.UIBackgroundModes must be an array of background mode strings")
+  }
+  const backgroundModes: string[] = declaredModes ?? []
+  if (!backgroundModes.includes(IOS_BLUETOOTH_BACKGROUND_MODE)) {
+    infoPlist.UIBackgroundModes = [...backgroundModes, IOS_BLUETOOTH_BACKGROUND_MODE]
+  }
   if (analytics.disabled !== undefined) {
     infoPlist[INFO_ANALYTICS_DISABLED] = analytics.disabled
+  }
+  if (analytics.environment !== undefined) {
+    infoPlist[INFO_ANALYTICS_ENVIRONMENT] = analytics.environment
   }
 
   return infoPlist

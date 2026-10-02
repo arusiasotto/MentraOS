@@ -1,14 +1,31 @@
-import {useMemo} from "react"
-import {useActiveApps, useApps} from "@mentra/engine"
+import {useMemo, useSyncExternalStore} from "react"
+import {SETTINGS, useActiveApps, useApps, useSetting} from "@mentra/engine"
 
-import {SETTINGS, useSetting} from "@mentra/engine"
+import {shouldHideMiniapp} from "@/services/miniapps/miniappVisibility"
+import {deploymentStore} from "@/services/deployment/store"
+
+const subscribeDeployment = (onChange: () => void) => deploymentStore.subscribe(onChange)
+const getDeployment = () => deploymentStore.getActive()
+
+/** Platform restrictions also apply to All Apps, which ignores home hiding. */
+export const useAvailableApps = () => {
+  const apps = useApps()
+  const [showIosCall] = useSetting<boolean>(SETTINGS.show_mentra_call_ios.key)
+  const [showIosNotify] = useSetting<boolean>(SETTINGS.show_notify_ios.key)
+  const [superMode] = useSetting<boolean>(SETTINGS.super_mode.key)
+  const deployment = useSyncExternalStore(subscribeDeployment, getDeployment)
+  return useMemo(
+    () => apps.filter((app) => !shouldHideMiniapp(app.packageName, app.version, {dev: app.isMiniappDev})),
+    [apps, showIosCall, showIosNotify, superMode, deployment],
+  )
+}
 
 /**
  * Foreground tray: standard + background apps. Filtered to offline-only when
  * `offline_mode` is on so cloud apps don't show up while disconnected.
  */
 export const useForegroundApps = () => {
-  const apps = useApps()
+  const apps = useAvailableApps()
   const [isOffline] = useSetting(SETTINGS.offline_mode.key)
   return useMemo(() => {
     if (isOffline) {
@@ -23,7 +40,7 @@ export const useForegroundApps = () => {
  * actually rendered in the home grid (running ones get the active card).
  */
 export const useInactiveForegroundApps = () => {
-  const apps = useApps()
+  const apps = useAvailableApps()
   const [isOffline] = useSetting(SETTINGS.offline_mode.key)
   return useMemo(() => {
     if (isOffline) {
@@ -38,7 +55,7 @@ export const useInactiveForegroundApps = () => {
  * if no wearable is selected (so the UI surface "all apps need glasses").
  */
 export const useIncompatibleApps = () => {
-  const apps = useApps()
+  const apps = useAvailableApps()
   const [defaultWearable] = useSetting(SETTINGS.default_wearable.key)
 
   return useMemo(() => {
